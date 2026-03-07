@@ -71,18 +71,6 @@ This creates the `DCR_SNOWVA.MIGRATION` schema with all stored procedures and th
 
 ### 2. Deploy the Streamlit App
 
-You have two options:
-
-#### Option A: Create from Repository (Preferred)
-
-1. In [app.snowflake.com](https://app.snowflake.com), navigate to **Streamlit**.
-2. Click **Create from Repository**.
-3. Paste the GitHub repository URL.
-4. Select the **Database** where the app will be stored and the **Warehouse** used to run it.
-5. Click **Create**.
-
-#### Option B: Manual Upload
-
 1. Download `streamlit_app.py` from the GitHub repository.
 2. In [app.snowflake.com](https://app.snowflake.com), navigate to **Streamlit**.
 3. Click **+ Streamlit App**.
