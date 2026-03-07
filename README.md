@@ -54,7 +54,7 @@ The DCR Migration Tool is an automated engine that upgrades legacy P&C API clean
 
 | Channel | Details |
 |---------|---------|
-| **Documentation (GA)** | [docs.snowflake.com/user-guide/cleanrooms/migration-to-collab](https://docs.snowflake.com/user-guide/cleanrooms/migration-to-collab) |
+| **Documentation (GA)** | |
 | **Direct link** | You may receive a link from Snowflake Support or Solutions Engineering |
 | **GitHub (v1)** | Download the code directly from the GitHub repository |
 
