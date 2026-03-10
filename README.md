@@ -1,3 +1,21 @@
+
+> [!CAUTION]
+> ## This repository has been migrated
+>
+> **This repo is archived and no longer maintained.**
+>
+> The canonical location is now:
+> **[Snowflake-Labs/dcr-migration-tool](https://github.com/Snowflake-Labs/dcr-migration-tool)**
+>
+> Please update your remote:
+> ```bash
+> git remote set-url origin https://github.com/Snowflake-Labs/dcr-migration-tool.git
+> ```
+>
+> All future development, issues, and pull requests should go to the new repo.
+
+---
+
 <!-- Copyright 2026 Snowflake Inc.
 SPDX-License-Identifier: Apache-2.0
 
