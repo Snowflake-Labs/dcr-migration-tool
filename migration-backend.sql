@@ -96,7 +96,7 @@ def check_prereqs(session, cleanroom_name):
     except:
         pass
 
-    # 5. Provider-side deep checks (multi-provider, python)
+    # 5. Provider-side deep checks (multi-provider)
     if target_uuid:
         try:
             mp_check = session.sql(f"SHOW TABLES LIKE 'APPROVED_MULTIPROVIDER_CLEANROOMS' IN SCHEMA SAMOOHA_CLEANROOM_{target_uuid}.ADMIN").collect()
@@ -104,16 +104,6 @@ def check_prereqs(session, cleanroom_name):
                 rows = session.sql(f"SELECT COUNT(*) as CNT FROM SAMOOHA_CLEANROOM_{target_uuid}.ADMIN.APPROVED_MULTIPROVIDER_CLEANROOMS").collect()
                 if rows and rows[0]['CNT'] > 0:
                     errors.append("Multi-provider cleanroom migration is not supported.")
-        except:
-            pass
-
-        try:
-            py_files = session.sql(f"ls @SAMOOHA_CLEANROOM_{target_uuid}.APP.CODE/V1_0P1").collect()
-            for f in py_files:
-                fname = f['name'].lower()
-                if fname.endswith('.py') or fname.endswith('.zip'):
-                    warnings.append("Cleanroom uses Python code. Migration will proceed; only SQL templates are auto-migrated. Python/UDF templates may require manual migration to the Collaboration API.")
-                    break
         except:
             pass
 
