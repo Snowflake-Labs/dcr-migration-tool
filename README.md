@@ -165,7 +165,7 @@ If a collaboration ends up in a bad state (`JOIN_FAILED`, etc.):
 | `No data offerings found` (Provider) | No linked datasets in legacy cleanroom | Link datasets to the legacy cleanroom before migrating |
 | `No data offerings found` (Consumer) | Normal for consumer-only migrations | The tool skips data registration and proceeds to joining |
 | Parity check shows "Missing templates" | Templates registered but not found in collaboration | Check the diagnostic output; may need to teardown and re-create the collaboration |
-| Python cleanroom: only some templates migrated | Python/UDF templates have no SQL to extract | Migration proceeds for data offerings and SQL templates; Python templates must be re-created manually in the Collaboration API if needed |
+| Python UDF not in generated script | UDF missing from `LOAD_PYTHON_RECORD` | Only UDFs in `LOAD_PYTHON_RECORD` are migrated to `REGISTER_CODE_SPEC`; re-run legacy `load_python_into_cleanroom` or add the UDF manually per [custom functions](https://docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions) |
 
 ---
 
