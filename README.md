@@ -170,6 +170,7 @@ If a collaboration ends up in a bad state (`JOIN_FAILED`, etc.):
 | `Cleanroom not found` | Wrong name or missing role | Verify the exact legacy cleanroom name and ensure `SAMOOHA_APP_ROLE` is active |
 | `No data offerings found` (Provider) | No linked datasets in legacy cleanroom | Link datasets to the legacy cleanroom before migrating |
 | `No data offerings found` (Consumer) | Normal for consumer-only migrations | The tool skips data registration and proceeds to joining |
+| Collaboration spec shows empty `Consumer_Account` data offerings | Provider migration cannot register the consumer’s table | Expected: consumer runs **Generate Plan** in the **consumer** account, registers their data offering, then `link_data_offering` so `my_table` appears in the spec (lookalike-style templates need both sides) |
 | Parity check shows "Missing templates" | Templates registered but not found in collaboration | Check the diagnostic output; may need to teardown and re-create the collaboration |
 | Python UDF not in generated script | UDF missing from `LOAD_PYTHON_RECORD` | Only UDFs in `LOAD_PYTHON_RECORD` are migrated to `REGISTER_CODE_SPEC`; re-run legacy `load_python_into_cleanroom` or add the UDF manually per [custom functions](https://docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions) |
 

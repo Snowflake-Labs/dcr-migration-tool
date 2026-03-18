@@ -966,10 +966,17 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
             runner_config['activation_destinations'] = {'snowflake_collaborators': ['Provider_Account']}
         runners['Provider_Account'] = runner_config
     else:
-        cons_runner_config = {
-            'templates': [{'id': x} for x in temp_ids]
+        # Consumer_Account runner must list BOTH collaborators' offerings: provider data (e.g. CUSTOMERS)
+        # and consumer data (e.g. labels / my_table). Previously only Provider_Account appeared, which made
+        # the spec look like the consumer data offering was "missing" for cross-table templates (lookalike).
+        cons_dp = {
+            'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]},
+            'Consumer_Account': {'data_offerings': [{'id': x} for x in cons_ids]},
         }
-        cons_runner_config['data_providers'] = {'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]}}
+        cons_runner_config = {
+            'templates': [{'id': x} for x in temp_ids],
+            'data_providers': cons_dp,
+        }
         if enable_activation:
             cons_runner_config['activation_destinations'] = {'snowflake_collaborators': ['Consumer_Account']}
         runners['Consumer_Account'] = cons_runner_config
@@ -977,7 +984,10 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
         if cons_ids:
             prov_runner_config = {
                 'templates': [{'id': x} for x in temp_ids],
-                'data_providers': {'Consumer_Account': {'data_offerings': [{'id': x} for x in cons_ids]}}
+                'data_providers': {
+                    'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]},
+                    'Consumer_Account': {'data_offerings': [{'id': x} for x in cons_ids]},
+                },
             }
             if enable_activation:
                  prov_runner_config['activation_destinations'] = {'snowflake_collaborators': ['Consumer_Account']}
@@ -994,7 +1004,10 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
             if can_prov_run:
                 prov_runner_config = {
                     'templates': [{'id': x} for x in temp_ids],
-                    'data_providers': {'Consumer_Account': {'data_offerings': []}} 
+                    'data_providers': {
+                        'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]},
+                        'Consumer_Account': {'data_offerings': []},
+                    },
                 }
                 if enable_activation:
                      prov_runner_config['activation_destinations'] = {'snowflake_collaborators': ['Consumer_Account']}
@@ -1484,6 +1497,10 @@ def agent_main(session, cleanroom_name, action_mode):
 
              script_lines.append(f"\n-- [{step_n}] CREATE COLLABORATION: {safe_collab_name}")
              script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.initialize({dd}\n{collab_yml}\n{dd});\n")
+             script_lines.append("-- NOTE: Under analysis_runners.Consumer_Account.data_providers you should see BOTH")
+             script_lines.append("-- Provider_Account (your linked table, e.g. CUSTOMERS) AND Consumer_Account.")
+             script_lines.append("-- Consumer_Account.data_offerings is [] until the consumer registers their dataset and links it.")
+             script_lines.append("-- Lookalike-style templates use source_table (provider) and my_table (consumer); both must appear in the spec.\n")
              script_lines.append(f"-- Wait for status 'CREATED' before joining")
              script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.get_status('{safe_collab_name}');\n")
              script_lines.append(f"-- [{step_n + 1}] JOIN COLLABORATION (Self-Join for Provider)")
