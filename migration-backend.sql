@@ -112,7 +112,7 @@ def check_prereqs(session, cleanroom_name):
             for f in py_files:
                 fname = f['name'].lower()
                 if fname.endswith('.py') or fname.endswith('.zip'):
-                    errors.append("Cleanroom uses Python code, which is not supported in this release.")
+                    warnings.append("Cleanroom uses Python code. Migration will proceed; only SQL templates are auto-migrated. Python/UDF templates may require manual migration to the Collaboration API.")
                     break
         except:
             pass
@@ -285,6 +285,126 @@ def _literal_str_representer(dumper, data):
 
 LiteralBlockDumper.add_representer(str, _literal_str_representer)
 
+def _sql_type_from_legacy(s):
+    if not s:
+        return 'VARIANT'
+    s = str(s).strip().lower()
+    mp = {'variant': 'VARIANT', 'string': 'STRING', 'varchar': 'STRING', 'float': 'FLOAT',
+          'number': 'NUMBER', 'integer': 'INTEGER', 'int': 'INTEGER', 'boolean': 'BOOLEAN', 'object': 'OBJECT'}
+    return mp.get(s, s.upper()[:64] if len(str(s)) < 64 else 'VARIANT')
+
+def _infer_py_arg_names(body, handler):
+    if not body or not handler:
+        return None
+    m = re.search(r'def\s+' + re.escape(str(handler)) + r'\s*\(([^)]*)\)', body, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return None
+    parts = []
+    for a in m.group(1).split(','):
+        a = a.strip()
+        if not a or a.startswith('*'):
+            continue
+        parts.append(a.split('=')[0].strip())
+    return parts if parts else None
+
+def _fetch_load_python_and_stage(session, cleanroom_name, is_provider):
+    if not is_provider:
+        return [], [], None
+    uuid = None
+    try:
+        p_res = session.sql("CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.PROVIDER.VIEW_CLEANROOMS()").collect()
+        for r in p_res:
+            d = {k.upper(): v for k, v in r.as_dict().items()}
+            c_name = d.get('CLEANROOM_NAME') or d.get('NAME')
+            if c_name and str(c_name).upper().replace(' ', '_') == cleanroom_name.upper().replace(' ', '_'):
+                uuid = d.get('CLEANROOM_ID') or d.get('ID')
+                break
+    except:
+        pass
+    rows = []
+    if uuid:
+        try:
+            q = f"""SELECT FUNCTION_NAME, ARGUMENT_TYPES,
+                PARSE_JSON(ADDITIONAL_PARAMS):handler::STRING AS HANDLER,
+                PARSE_JSON(ADDITIONAL_PARAMS):packages::STRING AS PACKAGES,
+                PARSE_JSON(ADDITIONAL_PARAMS):rettype::STRING AS RETURN_TYPE,
+                BODY
+            FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.LOAD_PYTHON_RECORD"""
+            for r in session.sql(q).collect():
+                rows.append({k.upper(): v for k, v in r.as_dict().items()})
+        except:
+            pass
+    stage_files = []
+    if uuid:
+        try:
+            for row in session.sql(f"ls @SAMOOHA_CLEANROOM_{uuid}.APP.CODE/V1_0P1").collect():
+                rd = row.as_dict() if hasattr(row, 'as_dict') else {}
+                nm = rd.get('name') or rd.get('NAME') or (row[0] if len(row) > 0 else None)
+                if nm:
+                    stage_files.append(str(nm))
+        except:
+            pass
+    return rows, stage_files, uuid
+
+def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_str):
+    functions = []
+    for row in py_rows:
+        fname = row.get('FUNCTION_NAME')
+        if not fname:
+            continue
+        handler = row.get('HANDLER') or str(fname).split('_')[-1]
+        arg_types_str = row.get('ARGUMENT_TYPES') or ''
+        types = [x.strip() for x in str(arg_types_str).split(',') if x.strip()]
+        names = _infer_py_arg_names(row.get('BODY') or '', handler)
+        if not names or len(names) != len(types):
+            names = ['arg_%d' % i for i in range(len(types))]
+        arguments = [{'name': names[i], 'type': _sql_type_from_legacy(types[i])} for i in range(len(types))]
+        pkg_raw = row.get('PACKAGES') or ''
+        packages = [p.strip() for p in str(pkg_raw).replace(';', ',').split(',') if p.strip()]
+        returns = _sql_type_from_legacy(row.get('RETURN_TYPE'))
+        body = (row.get('BODY') or '').rstrip() + '\n'
+        functions.append({
+            'name': str(fname),
+            'type': 'UDF',
+            'language': 'PYTHON',
+            'runtime_version': '3.10',
+            'handler': str(handler),
+            'arguments': arguments,
+            'returns': returns,
+            'packages': packages,
+            'code_body': body
+        })
+    if not functions:
+        return None
+    spec = {
+        'api_version': '2.0.0',
+        'spec_type': 'code_spec',
+        'name': code_spec_name,
+        'version': ver_str,
+        'description': 'Migrated Python UDFs from P&C cleanroom %s' % cleanroom_name,
+        'functions': functions
+    }
+    return yaml.dump(spec, Dumper=LiteralBlockDumper, default_flow_style=False, sort_keys=False)
+
+def _template_uses_python_udf(t_sql, py_fn_names):
+    for fn in py_fn_names:
+        if fn in t_sql:
+            return True
+    return False
+
+def _rewrite_python_udf_calls(t_sql, py_fn_names, spec_base):
+    for fn in sorted(py_fn_names, key=lambda x: -len(str(x))):
+        if not fn:
+            continue
+        esc = re.escape(str(fn))
+        t_sql = re.sub(
+            r'cleanroom\.\{\{\s*([a-zA-Z0-9_]+)\s*\|\s*default\(\s*[\'\"]' + esc + r'[\'\"]\s*\)\s*\|\s*sqlsafe\s*\}\}',
+            'cleanroom.%s${{ \\1 | default(\'%s\') | sqlsafe }}' % (spec_base, fn),
+            t_sql
+        )
+        t_sql = re.sub(r'cleanroom\.' + esc + r'(?=\s*\()', 'cleanroom.%s$%s' % (spec_base, fn), t_sql)
+    return t_sql
+
 def gen_templates(session, cleanroom_name):
     # --- ROLE DETECTION ---
     is_provider = False
@@ -306,7 +426,16 @@ def gen_templates(session, cleanroom_name):
         try: is_consumer = session.call("SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.CONSUMER.IS_ENABLED", cleanroom_name)
         except: pass
 
-    if not is_provider and not is_consumer: return []
+    if not is_provider and not is_consumer:
+        return {'templates': [], 'python_code_spec': None, 'python_udf_names': [], 'python_stage_files': []}
+
+    py_rows, stage_files, _uuid = _fetch_load_python_and_stage(session, cleanroom_name, is_provider)
+    ver_str = "MIGRATION_V1"
+    safe_cn = re.sub(r'[^a-zA-Z0-9_]', '_', cleanroom_name)[:50].strip('_') or 'cleanroom'
+    code_spec_name = 'migrated_py_%s' % safe_cn
+    py_code_yaml = _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_str) if py_rows else None
+    py_fn_names = [str(r.get('FUNCTION_NAME')) for r in py_rows if r.get('FUNCTION_NAME')]
+    code_spec_bundle_id = '%s_%s' % (code_spec_name, ver_str)
 
     df = pd.DataFrame()
     if is_provider:
@@ -324,7 +453,9 @@ def gen_templates(session, cleanroom_name):
             if df_res: df = pd.DataFrame([r.as_dict() for r in df_res])
         except: pass
 
-    if df.empty: return []
+    if df.empty:
+        return {'templates': [], 'python_code_spec': py_code_yaml, 'python_udf_names': py_fn_names,
+                'python_stage_files': stage_files}
     
     norm_data = []
     for _, row in df.iterrows():
@@ -406,6 +537,11 @@ def gen_templates(session, cleanroom_name):
 
         params = [normalize_param(p) for p in params]
 
+        tpl_work = cleaned_sql
+        uses_py = bool(py_fn_names) and _template_uses_python_udf(tpl_work, py_fn_names)
+        if uses_py:
+            tpl_work = _rewrite_python_udf_calls(tpl_work, set(py_fn_names), code_spec_name)
+
         spec_dict_no_tpl = {
             'api_version': '2.0.0', 
             'spec_type': 'template', 
@@ -415,9 +551,11 @@ def gen_templates(session, cleanroom_name):
             'description': f"Migrated from legacy: {t_name}", 
             'parameters': params
         }
+        if uses_py and py_code_yaml:
+            spec_dict_no_tpl['code_specs'] = [code_spec_bundle_id]
         yaml_header = yaml.dump(spec_dict_no_tpl, Dumper=LiteralBlockDumper, default_flow_style=False, sort_keys=False)
 
-        tpl_clean = cleaned_sql.strip()
+        tpl_clean = tpl_work.strip()
         if '\n' in tpl_clean:
             tpl_lines = tpl_clean.split('\n')
             indented = '\n'.join('  ' + line.rstrip() for line in tpl_lines)
@@ -427,7 +565,12 @@ def gen_templates(session, cleanroom_name):
             yaml_out = yaml_header + f"template: '{safe_tpl}'\n"
 
         specs.append(yaml_out)
-    return specs
+    return {
+        'templates': specs,
+        'python_code_spec': py_code_yaml,
+        'python_udf_names': py_fn_names,
+        'python_stage_files': stage_files
+    }
 $$;
 
 CREATE OR REPLACE PROCEDURE DCR_SNOWVA.MIGRATION.GENERATE_DATA_OFFERING_SPECS(CLEANROOM_NAME STRING)
@@ -1253,7 +1396,17 @@ def agent_main(session, cleanroom_name, action_mode):
             return _finish(json.dumps({"status": "SUCCESS", "message": res}))
 
         res_tmps = session.call("DCR_SNOWVA.MIGRATION.GENERATE_TEMPLATE_SPECS", cleanroom_name)
-        tmps = json.loads(res_tmps) if isinstance(res_tmps, str) else res_tmps
+        _tpack = json.loads(res_tmps) if isinstance(res_tmps, str) else res_tmps
+        if isinstance(_tpack, list):
+            tmps = _tpack
+            py_code_spec = None
+            py_udf_names = []
+            py_stage_files = []
+        else:
+            tmps = _tpack.get('templates', [])
+            py_code_spec = _tpack.get('python_code_spec')
+            py_udf_names = _tpack.get('python_udf_names', [])
+            py_stage_files = _tpack.get('python_stage_files', [])
         
         res_dos = session.call("DCR_SNOWVA.MIGRATION.GENERATE_DATA_OFFERING_SPECS", cleanroom_name)
         dos = json.loads(res_dos) if isinstance(res_dos, str) else res_dos
@@ -1268,17 +1421,26 @@ def agent_main(session, cleanroom_name, action_mode):
         script_lines.append(f"-- MIGRATION SCRIPT FOR: {cleanroom_name} ({role_type})")
         script_lines.append("-- Generated via DCR_SNOWVA.MIGRATION Package\n")
 
+        step_n = 0
+        if py_code_spec:
+            script_lines.append("-- [0] REGISTER PYTHON CODE SPEC (Collaboration custom functions / UDFs)")
+            script_lines.append("-- Ref: https://docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions")
+            script_lines.append(f"CALL samooha_by_snowflake_local_db.registry.register_code_spec({dd}\n{py_code_spec}\n{dd});\n")
+            step_n = 1
+
         if tmps:
-            script_lines.append(f"-- [1] REGISTER TEMPLATES ({len(tmps)} found)")
+            script_lines.append(f"-- [{step_n}] REGISTER TEMPLATES ({len(tmps)} found)")
             for y_str in tmps:
                 script_lines.append(f"CALL samooha_by_snowflake_local_db.registry.register_template({dd}\n{y_str}\n{dd});\n")
+            step_n += 1
 
         if dos:
-            script_lines.append(f"\n-- [2] REGISTER DATA OFFERINGS ({len(dos)} found)")
+            script_lines.append(f"\n-- [{step_n}] REGISTER DATA OFFERINGS ({len(dos)} found)")
             for y_str in dos:
                 spec = yaml.safe_load(y_str)
                 script_lines.append(f"-- {role_type} Offering: {spec['name']}")
                 script_lines.append(f"CALL samooha_by_snowflake_local_db.registry.register_data_offering({dd}\n{y_str}\n{dd});\n")
+            step_n += 1
 
         if is_provider:
              prov_ds_df = session.sql(f"CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.PROVIDER.view_provider_datasets('{cleanroom_name}')").collect()
@@ -1330,11 +1492,11 @@ def agent_main(session, cleanroom_name, action_mode):
 
              collab_yml = session.call("DCR_SNOWVA.MIGRATION.GENERATE_COLLABORATION_SPEC", cleanroom_name, prov_ids, [], tmp_ids, has_activation)
 
-             script_lines.append(f"\n-- [3] CREATE COLLABORATION: {safe_collab_name}")
+             script_lines.append(f"\n-- [{step_n}] CREATE COLLABORATION: {safe_collab_name}")
              script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.initialize({dd}\n{collab_yml}\n{dd});\n")
              script_lines.append(f"-- Wait for status 'CREATED' before joining")
              script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.get_status('{safe_collab_name}');\n")
-             script_lines.append(f"-- [4] JOIN COLLABORATION (Self-Join for Provider)")
+             script_lines.append(f"-- [{step_n + 1}] JOIN COLLABORATION (Self-Join for Provider)")
              script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.join('{safe_collab_name}');\n")
              if is_prov_run:
                  script_lines.append(f"-- [5] PROVIDER-RUN ANALYSIS DETECTED")
@@ -1388,22 +1550,40 @@ def agent_main(session, cleanroom_name, action_mode):
         if action == 'PLAN':
             t_count = len(tmps) if tmps else 0
             d_count = len(dos) if dos else 0
-            
-            return _finish(json.dumps({
+            py_note = ""
+            if py_udf_names:
+                py_note = " Python UDFs from LOAD_PYTHON_RECORD: %s." % (", ".join(py_udf_names[:20]))
+            plan_payload = {
                 "status": "READY_TO_MIGRATE",
                 "role": role_type,
-                "summary": f"Found {t_count} templates and {d_count} datasets.{laf_info}",
+                "summary": f"Found {t_count} templates and {d_count} datasets.{py_note}{laf_info}",
                 "generated_script": full_script_text,
                 "next_step": "Ask user to confirm execution.",
                 "details": {
                     "templates": tmps,
                     "provider_data": dos,
-                    "target_collaboration": safe_collab_name
+                    "target_collaboration": safe_collab_name,
+                    "python_udf_names": py_udf_names,
+                    "python_stage_files": py_stage_files[:30],
+                    "has_python_code_spec": bool(py_code_spec)
                 }
-            }))
+            }
+            if prereq_warnings:
+                plan_payload["warnings"] = prereq_warnings
+            return _finish(json.dumps(plan_payload))
 
         elif action == 'EXECUTE':
             actions_taken = []
+            
+            if py_code_spec:
+                try:
+                    session.call("SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.REGISTRY.REGISTER_CODE_SPEC", py_code_spec)
+                    actions_taken.append("Registered Python code_spec (custom UDF bundle)")
+                except Exception as e:
+                    if "already exists" in str(e).lower():
+                        actions_taken.append("Python code_spec already registered (skipped)")
+                    else:
+                        raise e
             
             if tmps:
                 for y_str in tmps:

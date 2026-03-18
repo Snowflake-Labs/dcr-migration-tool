@@ -35,7 +35,8 @@ The DCR Migration Tool is an automated engine that upgrades legacy P&C API clean
 - **Automated Discovery** — Detects your role (Provider or Consumer) and enumerates templates, datasets, and policies from the legacy cleanroom.
 - **Spec Generation** — Converts legacy SQL templates and table policies into v2.0 compliant YAML specs with literal block style for readability.
 - **Smart Column Type Detection** — Recognizes common join column abbreviations (`HEM`, `HPN`, `IDFA`, etc.) and maps them to valid Snowflake `column_type` identifiers.
-- **Safety Guardrails** — Pre-flight checks prevent migration of unsupported configurations (Python UDFs, multi-provider, etc.).
+- **Python Cleanroom & UDF Migration** — Reads `SAMOOHA_CLEANROOM_<id>.SHARED_SCHEMA.LOAD_PYTHON_RECORD` and lists `@APP.CODE/V1_0P1`. Builds a Collaboration **code_spec** ([custom functions](https://docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions)) via `REGISTER_CODE_SPEC`, rewrites template SQL from `cleanroom.<udf>(` / Jinja `default('<udf>')` to `cleanroom.<migrated_py_spec>$<udf>(`, and registers templates with `code_specs` linkage. Requires Snowflake Data Clean Rooms 12.9+ where custom functions are enabled.
+- **Safety Guardrails** — Pre-flight checks block unsupported configurations (multi-provider, LAF, UI-created cleanrooms).
 - **Deterministic Versioning** — Provider and Consumer generate matching artifact IDs without manual coordination.
 - **Parity Validation** — Compares the new Collaboration against the legacy Cleanroom to verify template and data offering coverage.
 - **Audit Logging** — Every migration run is logged to `MIGRATION_JOBS` with job ID, timestamps, status, and details.
@@ -164,6 +165,7 @@ If a collaboration ends up in a bad state (`JOIN_FAILED`, etc.):
 | `No data offerings found` (Provider) | No linked datasets in legacy cleanroom | Link datasets to the legacy cleanroom before migrating |
 | `No data offerings found` (Consumer) | Normal for consumer-only migrations | The tool skips data registration and proceeds to joining |
 | Parity check shows "Missing templates" | Templates registered but not found in collaboration | Check the diagnostic output; may need to teardown and re-create the collaboration |
+| Python cleanroom: only some templates migrated | Python/UDF templates have no SQL to extract | Migration proceeds for data offerings and SQL templates; Python templates must be re-created manually in the Collaboration API if needed |
 
 ---
 

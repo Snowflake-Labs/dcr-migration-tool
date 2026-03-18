@@ -427,6 +427,23 @@ else:
     if role == 'CONSUMER' and not details.get('provider_data'):
         st.warning("No consumer data offerings were detected. Ensure you have linked datasets and set join/column policies on the legacy cleanroom before migrating.")
 
+    for w in plan.get('warnings', []):
+        st.warning(w)
+
+    if details.get("has_python_code_spec"):
+        udfs = details.get("python_udf_names") or []
+        st.success(
+            f"Python / custom UDFs: {len(udfs)} function(s) from LOAD_PYTHON_RECORD → REGISTER_CODE_SPEC "
+            f"(Collaboration custom functions). UDFs: {', '.join(udfs[:15])}"
+            + (" …" if len(udfs) > 15 else "")
+        )
+        st.caption("See: docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions")
+        sf = details.get("python_stage_files") or []
+        if sf:
+            with st.expander(f"Stage files @APP.CODE/V1_0P1 ({len(sf)})"):
+                st.caption("Files on the cleanroom code stage (for reference).")
+                st.text("\n".join(sf[:40]))
+
     st.divider()
 
     # Tabs
