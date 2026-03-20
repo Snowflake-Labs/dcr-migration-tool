@@ -330,7 +330,7 @@ def _infer_py_arg_names(body, handler):
 
 
 def _normalize_code_body_for_yaml(body):
-    """Dedent stored Python so PyYAML emits a plain '|' block (avoids fragile '|N' indicators)."""
+    """Dedent stored Python before YAML dump (helps consistent block layout)."""
     if not body:
         return '\n'
     b = str(body).replace('\r\n', '\n').replace('\r', '\n').rstrip() + '\n'
@@ -339,6 +339,21 @@ def _normalize_code_body_for_yaml(body):
     except Exception:
         pass
     return b
+
+
+def _strip_code_body_indentation_indicators(yaml_text):
+    """PyYAML often emits 'code_body: |2' (explicit indent); Snowflake docs show plain '|'.
+
+    The digit is only PyYAML's indent hint — removing it yields standard literal '|' / '|-' / '|+'
+    while keeping the same following lines, which YAML 1.1 parses the same way.
+    """
+    if not yaml_text:
+        return yaml_text
+
+    def _repl(m):
+        return m.group(1) + '|' + (m.group(3) or '')
+
+    return re.sub(r'(^[ \t]*code_body: )\|(\d*)([-+]?)[ \t]*$', _repl, yaml_text, flags=re.MULTILINE)
 
 def _fetch_load_python_and_stage(session, cleanroom_name, is_provider):
     if not is_provider:
@@ -417,7 +432,8 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
         'description': 'Migrated Python UDFs from P&C cleanroom %s' % cleanroom_name,
         'functions': functions
     }
-    return yaml.dump(spec, Dumper=LiteralBlockDumper, default_flow_style=False, sort_keys=False)
+    dumped = yaml.dump(spec, Dumper=LiteralBlockDumper, default_flow_style=False, sort_keys=False)
+    return _strip_code_body_indentation_indicators(dumped)
 
 def _template_uses_python_udf(t_sql, py_fn_names):
     for fn in py_fn_names:
