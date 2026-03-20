@@ -262,6 +262,7 @@ $$
 import yaml
 import pandas as pd
 import re
+import textwrap
 from datetime import datetime
 import json
 
@@ -283,19 +284,61 @@ def _sql_type_from_legacy(s):
           'number': 'NUMBER', 'integer': 'INTEGER', 'int': 'INTEGER', 'boolean': 'BOOLEAN', 'object': 'OBJECT'}
     return mp.get(s, s.upper()[:64] if len(str(s)) < 64 else 'VARIANT')
 
+def _split_py_params(param_str):
+    """Split a Python parameter list on commas not inside ()[]{}."""
+    if not param_str or not str(param_str).strip():
+        return []
+    depth = 0
+    cur = []
+    parts = []
+    for c in param_str:
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+        elif c == ',' and depth == 0:
+            parts.append(''.join(cur).strip())
+            cur = []
+            continue
+        cur.append(c)
+    if cur:
+        parts.append(''.join(cur).strip())
+    return [p for p in parts if p]
+
+
 def _infer_py_arg_names(body, handler):
+    """Match YAML argument names to the Python handler signature (v2 docs / metadata)."""
     if not body or not handler:
         return None
     m = re.search(r'def\s+' + re.escape(str(handler)) + r'\s*\(([^)]*)\)', body, re.IGNORECASE | re.DOTALL)
     if not m:
         return None
+    raw = m.group(1).strip()
+    if not raw:
+        return []
     parts = []
-    for a in m.group(1).split(','):
+    for a in _split_py_params(raw):
         a = a.strip()
         if not a or a.startswith('*'):
             continue
-        parts.append(a.split('=')[0].strip())
+        pre_default = a.split('=', 1)[0].strip()
+        name = pre_default.split(':', 1)[0].strip()
+        if not name or name in ('self', 'cls'):
+            continue
+        parts.append(name)
     return parts if parts else None
+
+
+def _normalize_code_body_for_yaml(body):
+    """Dedent stored Python so PyYAML emits a plain '|' block (avoids fragile '|N' indicators)."""
+    if not body:
+        return '\n'
+    b = str(body).replace('\r\n', '\n').replace('\r', '\n').rstrip() + '\n'
+    try:
+        b = textwrap.dedent(b)
+    except Exception:
+        pass
+    return b
 
 def _fetch_load_python_and_stage(session, cleanroom_name, is_provider):
     if not is_provider:
@@ -352,7 +395,7 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
         pkg_raw = row.get('PACKAGES') or ''
         packages = [p.strip() for p in str(pkg_raw).replace(';', ',').split(',') if p.strip()]
         returns = _sql_type_from_legacy(row.get('RETURN_TYPE'))
-        body = (row.get('BODY') or '').rstrip() + '\n'
+        body = _normalize_code_body_for_yaml(row.get('BODY') or '')
         functions.append({
             'name': str(fname),
             'type': 'UDF',

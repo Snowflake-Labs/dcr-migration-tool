@@ -173,6 +173,7 @@ If a collaboration ends up in a bad state (`JOIN_FAILED`, etc.):
 | Collaboration spec shows empty `Consumer_Account` data offerings | Provider migration cannot register the consumer’s table | Expected: consumer runs **Generate Plan** in the **consumer** account, registers their data offering, then `link_data_offering` so `my_table` appears in the spec (lookalike-style templates need both sides) |
 | Parity check shows "Missing templates" | Templates registered but not found in collaboration | Check the diagnostic output; may need to teardown and re-create the collaboration |
 | Python UDF not in generated script | UDF missing from `LOAD_PYTHON_RECORD` | Only UDFs in `LOAD_PYTHON_RECORD` are migrated to `REGISTER_CODE_SPEC`; re-run legacy `load_python_into_cleanroom` or add the UDF manually per [custom functions](https://docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions) |
+| `SpecValidationError` on `register_code_spec` (YAML / `code_body`) | Block-scalar indentation or bad parse of stored `BODY` | The generator dedents Python from `LOAD_PYTHON_RECORD` and parses handler params (incl. type hints) so names align with `arguments`; if it still fails, compare generated YAML to [custom functions](https://docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions) |
 
 ---
 
