@@ -307,13 +307,24 @@ def _split_py_params(param_str):
 
 
 def _infer_py_arg_names(body, handler):
-    """Match YAML argument names to the Python handler signature (v2 docs / metadata)."""
+    """Match YAML argument names to the Python handler signature (v2 docs / metadata).
+
+    Only module-level `def handler(...)` counts — avoids class methods like `def train(self, X, y)`.
+    """
     if not body or not handler:
         return None
-    m = re.search(r'def\s+' + re.escape(str(handler)) + r'\s*\(([^)]*)\)', body, re.IGNORECASE | re.DOTALL)
-    if not m:
+    pat = re.compile(
+        r'^(\s*)def\s+' + re.escape(str(handler)) + r'\s*\(([^)]*)\)',
+        re.MULTILINE | re.IGNORECASE | re.DOTALL,
+    )
+    raw = None
+    for m in pat.finditer(body):
+        if len(m.group(1)) > 0:
+            continue
+        raw = m.group(2).strip()
+        break
+    if raw is None:
         return None
-    raw = m.group(1).strip()
     if not raw:
         return []
     parts = []
@@ -374,21 +385,50 @@ def _coerce_imports_list(v):
     return []
 
 
+def _normalize_import_path_fragment(s):
+    if s is None:
+        return None
+    t = str(s).strip().strip('"').strip("'")
+    while len(t) >= 2 and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
+        t = t[1:-1].strip()
+    if not t or t in ('""', "''", 'null', 'None'):
+        return None
+    return t
+
+
+def _imports_look_like_real_stage_paths(items):
+    """Ignore placeholder/junk imports (e.g. empty strings) that Samooha may store for inline UDFs."""
+    if not items:
+        return False
+    for s in items:
+        if s.startswith('@'):
+            return True
+        if '/' in s:
+            return True
+        low = s.lower()
+        if low.endswith('.py') or low.endswith('.whl'):
+            return True
+    return False
+
+
 def _extract_imports_from_row(row):
-    """P&C load_python_into_cleanroom (stage signature) stores imports in ADDITIONAL_PARAMS.imports."""
+    """P&C stage overload stores imports in ADDITIONAL_PARAMS.imports; inline UDFs may leave noise — normalize and drop empties."""
     parsed = _coerce_imports_list(row.get('IMPORTS'))
-    if parsed:
-        return parsed
-    ap = row.get('ADDITIONAL_PARAMS')
-    if not ap:
-        return []
-    try:
-        d = json.loads(ap) if isinstance(ap, str) else ap
-        if isinstance(d, dict):
-            return _coerce_imports_list(d.get('imports'))
-    except Exception:
-        pass
-    return []
+    if not parsed:
+        ap = row.get('ADDITIONAL_PARAMS')
+        if ap:
+            try:
+                d = json.loads(ap) if isinstance(ap, str) else ap
+                if isinstance(d, dict):
+                    parsed = _coerce_imports_list(d.get('imports'))
+            except Exception:
+                parsed = []
+    out = []
+    for x in (parsed or []):
+        n = _normalize_import_path_fragment(x)
+        if n:
+            out.append(n)
+    return out
 
 
 def _legacy_arg_names_from_types(types):
@@ -498,9 +538,13 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
         pkg_raw = row.get('PACKAGES') or ''
         packages = [p.strip() for p in str(pkg_raw).replace(';', ',').split(',') if p.strip()]
         returns = _sql_type_from_legacy(row.get('RETURN_TYPE'))
-        body = _normalize_code_body_for_yaml(row.get('BODY') or '')
+        body_raw = row.get('BODY') or ''
+        body = _normalize_code_body_for_yaml(body_raw)
+        body_nonempty = bool(str(body_raw).strip())
         imports_list = _extract_imports_from_row(row)
-        use_stage = bool(imports_list) and bool(cleanroom_uuid)
+        imports_ok = _imports_look_like_real_stage_paths(imports_list)
+        # Inline load_python always has BODY; prefer code_body. Stage overload has no body + real paths like /file.py.
+        use_stage = bool(cleanroom_uuid) and imports_ok and (not body_nonempty)
 
         fn_entry = {
             'name': str(fname),
@@ -520,7 +564,7 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
                 fn_aliases.append(_ensure_artifact(sp))
             fn_entry['imports'] = fn_aliases
         else:
-            if not str(body).strip():
+            if not body_nonempty:
                 continue
             fn_entry['code_body'] = body
         functions.append(fn_entry)
