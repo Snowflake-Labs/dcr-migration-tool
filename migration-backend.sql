@@ -355,6 +355,76 @@ def _strip_code_body_indentation_indicators(yaml_text):
 
     return re.sub(r'(^[ \t]*code_body: )\|(\d*)([-+]?)[ \t]*$', _repl, yaml_text, flags=re.MULTILINE)
 
+
+def _coerce_imports_list(v):
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if x is not None and str(x).strip()]
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        if s.startswith('['):
+            try:
+                return _coerce_imports_list(json.loads(s))
+            except Exception:
+                return []
+        return [s]
+    return []
+
+
+def _extract_imports_from_row(row):
+    """P&C load_python_into_cleanroom (stage signature) stores imports in ADDITIONAL_PARAMS.imports."""
+    parsed = _coerce_imports_list(row.get('IMPORTS'))
+    if parsed:
+        return parsed
+    ap = row.get('ADDITIONAL_PARAMS')
+    if not ap:
+        return []
+    try:
+        d = json.loads(ap) if isinstance(ap, str) else ap
+        if isinstance(d, dict):
+            return _coerce_imports_list(d.get('imports'))
+    except Exception:
+        pass
+    return []
+
+
+def _legacy_arg_names_from_types(types):
+    names = []
+    for t in types:
+        s = str(t).strip()
+        if not s:
+            continue
+        tok = s.split(None, 1)
+        if tok:
+            names.append(tok[0])
+    return names
+
+
+def _detect_code_patch_prefix(stage_files):
+    if not stage_files:
+        return 'V1_0P1'
+    counts = {}
+    for sf in stage_files:
+        parts = str(sf).split('/')
+        if parts and re.match(r'^V\d+_\d+P\d+$', parts[0]):
+            counts[parts[0]] = counts.get(parts[0], 0) + 1
+    if counts:
+        return max(counts.items(), key=lambda x: x[1])[0]
+    return 'V1_0P1'
+
+
+def _import_path_to_stage_fqn(cleanroom_uuid, rel_path, patch_prefix):
+    rel = str(rel_path).strip()
+    if rel.startswith('@'):
+        return rel
+    rel = rel.lstrip('/')
+    cr = 'SAMOOHA_CLEANROOM_%s' % cleanroom_uuid
+    return '@%s.APP.CODE/%s/%s' % (cr, patch_prefix, rel)
+
+
 def _fetch_load_python_and_stage(session, cleanroom_name, is_provider):
     if not is_provider:
         return [], [], None
@@ -372,11 +442,11 @@ def _fetch_load_python_and_stage(session, cleanroom_name, is_provider):
     rows = []
     if uuid:
         try:
-            q = f"""SELECT FUNCTION_NAME, ARGUMENT_TYPES,
-                PARSE_JSON(ADDITIONAL_PARAMS):handler::STRING AS HANDLER,
-                PARSE_JSON(ADDITIONAL_PARAMS):packages::STRING AS PACKAGES,
-                PARSE_JSON(ADDITIONAL_PARAMS):rettype::STRING AS RETURN_TYPE,
-                BODY
+            q = f"""SELECT FUNCTION_NAME, ARGUMENT_TYPES, BODY, ADDITIONAL_PARAMS,
+                TRY_PARSE_JSON(ADDITIONAL_PARAMS):handler::STRING AS HANDLER,
+                TRY_PARSE_JSON(ADDITIONAL_PARAMS):packages::STRING AS PACKAGES,
+                TRY_PARSE_JSON(ADDITIONAL_PARAMS):rettype::STRING AS RETURN_TYPE,
+                TRY_PARSE_JSON(ADDITIONAL_PARAMS):imports AS IMPORTS
             FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.LOAD_PYTHON_RECORD"""
             for r in session.sql(q).collect():
                 rows.append({k.upper(): v for k, v in r.as_dict().items()})
@@ -394,8 +464,21 @@ def _fetch_load_python_and_stage(session, cleanroom_name, is_provider):
             pass
     return rows, stage_files, uuid
 
-def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_str):
+def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_str, cleanroom_uuid=None, stage_files=None):
+    """Inline BODY -> code_body; stage load_python (imports[]) -> Collaboration artifacts + function imports (v2 custom functions)."""
+    patch_prefix = _detect_code_patch_prefix(stage_files or [])
+    path_to_alias = {}
+    artifact_specs = []
     functions = []
+
+    def _ensure_artifact(stage_path):
+        if stage_path in path_to_alias:
+            return path_to_alias[stage_path]
+        alias = 'artifact_%d' % len(path_to_alias)
+        path_to_alias[stage_path] = alias
+        artifact_specs.append({'alias': alias, 'stage_path': stage_path})
+        return alias
+
     for row in py_rows:
         fname = row.get('FUNCTION_NAME')
         if not fname:
@@ -403,15 +486,23 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
         handler = row.get('HANDLER') or str(fname).split('_')[-1]
         arg_types_str = row.get('ARGUMENT_TYPES') or ''
         types = [x.strip() for x in str(arg_types_str).split(',') if x.strip()]
-        names = _infer_py_arg_names(row.get('BODY') or '', handler)
+        hinfer = str(handler).rsplit('.', 1)[-1] if '.' in str(handler) else str(handler)
+        names = _infer_py_arg_names(row.get('BODY') or '', hinfer)
         if not names or len(names) != len(types):
-            names = ['arg_%d' % i for i in range(len(types))]
+            leg = _legacy_arg_names_from_types(types)
+            if leg and len(leg) == len(types):
+                names = leg
+            else:
+                names = ['arg_%d' % i for i in range(len(types))]
         arguments = [{'name': names[i], 'type': _sql_type_from_legacy(types[i])} for i in range(len(types))]
         pkg_raw = row.get('PACKAGES') or ''
         packages = [p.strip() for p in str(pkg_raw).replace(';', ',').split(',') if p.strip()]
         returns = _sql_type_from_legacy(row.get('RETURN_TYPE'))
         body = _normalize_code_body_for_yaml(row.get('BODY') or '')
-        functions.append({
+        imports_list = _extract_imports_from_row(row)
+        use_stage = bool(imports_list) and bool(cleanroom_uuid)
+
+        fn_entry = {
             'name': str(fname),
             'type': 'UDF',
             'language': 'PYTHON',
@@ -420,8 +511,20 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
             'arguments': arguments,
             'returns': returns,
             'packages': packages,
-            'code_body': body
-        })
+        }
+
+        if use_stage:
+            fn_aliases = []
+            for rel in imports_list:
+                sp = _import_path_to_stage_fqn(cleanroom_uuid, rel, patch_prefix)
+                fn_aliases.append(_ensure_artifact(sp))
+            fn_entry['imports'] = fn_aliases
+        else:
+            if not str(body).strip():
+                continue
+            fn_entry['code_body'] = body
+        functions.append(fn_entry)
+
     if not functions:
         return None
     spec = {
@@ -430,8 +533,10 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
         'name': code_spec_name,
         'version': ver_str,
         'description': 'Migrated Python UDFs from P&C cleanroom %s' % cleanroom_name,
-        'functions': functions
     }
+    if artifact_specs:
+        spec['artifacts'] = artifact_specs
+    spec['functions'] = functions
     dumped = yaml.dump(spec, Dumper=LiteralBlockDumper, default_flow_style=False, sort_keys=False)
     return _strip_code_body_indentation_indicators(dumped)
 
@@ -482,7 +587,7 @@ def gen_templates(session, cleanroom_name):
     ver_str = "MIGRATION_V1"
     safe_cn = re.sub(r'[^a-zA-Z0-9_]', '_', cleanroom_name)[:50].strip('_') or 'cleanroom'
     code_spec_name = 'migrated_py_%s' % safe_cn
-    py_code_yaml = _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_str) if py_rows else None
+    py_code_yaml = _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_str, _uuid, stage_files) if py_rows else None
     py_fn_names = [str(r.get('FUNCTION_NAME')) for r in py_rows if r.get('FUNCTION_NAME')]
     code_spec_bundle_id = '%s_%s' % (code_spec_name, ver_str)
 

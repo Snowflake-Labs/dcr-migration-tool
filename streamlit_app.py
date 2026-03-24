@@ -434,7 +434,7 @@ else:
         udfs = details.get("python_udf_names") or []
         st.success(
             f"Python / custom UDFs: {len(udfs)} function(s) from LOAD_PYTHON_RECORD → REGISTER_CODE_SPEC "
-            f"(Collaboration custom functions). UDFs: {', '.join(udfs[:15])}"
+            f"(inline `code_body` and/or stage `artifacts`+`imports` when `imports` is stored in metadata). UDFs: {', '.join(udfs[:15])}"
             + (" …" if len(udfs) > 15 else "")
         )
         st.caption("See: docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions")
