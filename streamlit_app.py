@@ -440,7 +440,13 @@ else:
     # Dashboard Metrics
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Role", role)
-    m2.metric("Templates", len(details.get('templates', [])))
+    _tpls = details.get("templates") or []
+    _tpl_reg = sum(
+        1
+        for t in _tpls
+        if not (isinstance(t, dict) and t.get("classification") == "PLATFORM_PRIVACY")
+    )
+    m2.metric("Templates", _tpl_reg)
     m3.metric("Data Offerings", len(details.get('provider_data', [])))
     m4.metric("Status", st.session_state.get('collab_status', 'Not Started'))
 

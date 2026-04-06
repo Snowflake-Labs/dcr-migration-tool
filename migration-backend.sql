@@ -176,13 +176,24 @@ def check_prereqs(session, cleanroom_name):
             "UI form customizations (e.g. add_ui_form_customizations) are not migrated; Collaboration APIs have no equivalent."
         )
 
-    # LAF Check (consumer APIs key off cleanroom id)
+    # LAF check (API uses cleanroom id / UUID, not display name)
     try:
         if role == "CONSUMER":
             is_laf = session.call("SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.CONSUMER.IS_LAF_ENABLED_FOR_CLEANROOM", api)
             if is_laf:
                 errors.append(
-                    f"LAF (Cross-Cloud Auto-Fulfillment) is enabled for cleanroom '{cleanroom_name}'. LAF cleanroom migration is not supported."
+                    f"LAF (Cross-Cloud Auto-Fulfillment) is enabled for this cleanroom (id={api}). "
+                    "LAF cleanroom migration is not supported."
+                )
+    except Exception:
+        pass
+    try:
+        if role == "PROVIDER":
+            is_laf_p = session.call("SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.CONSUMER.IS_LAF_ENABLED_FOR_CLEANROOM", api)
+            if is_laf_p:
+                errors.append(
+                    f"LAF (Cross-Cloud Auto-Fulfillment) is enabled for this cleanroom (id={api}). "
+                    "LAF cleanroom migration is not supported."
                 )
     except Exception:
         pass
@@ -206,9 +217,47 @@ def check_prereqs(session, cleanroom_name):
         except:
             pass
 
+    cleanroom_type = "UNKNOWN"
+    is_ui_flag = bool(resolved.get("is_ui_cleanroom"))
+    if target_uuid:
+        has_ui_freeform = False
+        has_pc_freeform = False
+        try:
+            sql_tables = session.sql(
+                f"SELECT COUNT(*) AS CNT FROM SAMOOHA_CLEANROOM_{target_uuid}.SHARED_SCHEMA.TABLES_ENABLED_FOR_SQL"
+            ).collect()
+            if sql_tables and sql_tables[0]['CNT'] > 0:
+                has_ui_freeform = True
+        except Exception:
+            pass
+        try:
+            wf = session.sql(
+                f"SELECT COUNT(*) AS CNT FROM SAMOOHA_CLEANROOM_{target_uuid}.SHARED_SCHEMA.WORKFLOWS_ENABLED "
+                f"WHERE WORKFLOW_NAME = 'freeform_sql'"
+            ).collect()
+            if wf and wf[0]['CNT'] > 0:
+                has_pc_freeform = True
+        except Exception:
+            pass
+        if is_ui_flag:
+            cleanroom_type = "UI_FREEFORM_SQL" if has_ui_freeform else "UI_TEMPLATE_ONLY"
+        else:
+            cleanroom_type = "PC_FREEFORM_SQL" if has_pc_freeform else "PC_TEMPLATE_ONLY"
+        warnings.append("Cleanroom classified as: %s" % cleanroom_type)
+
     if errors:
-        return {"status": "FAIL", "errors": errors, "warnings": warnings}
-    result = {"status": "PASS"}
+        out_fail = {"status": "FAIL", "errors": errors, "warnings": warnings, "cleanroom_type": cleanroom_type}
+        out_fail["is_ui_cleanroom"] = is_ui_flag
+        out_fail["target_uuid"] = target_uuid
+        out_fail["api_cleanroom_name"] = api
+        return out_fail
+    result = {
+        "status": "PASS",
+        "cleanroom_type": cleanroom_type,
+        "is_ui_cleanroom": is_ui_flag,
+        "target_uuid": target_uuid,
+        "api_cleanroom_name": api,
+    }
     if warnings:
         result["warnings"] = warnings
     return result
@@ -224,10 +273,23 @@ EXECUTE AS CALLER
 AS
 $$
 import json
+import re
 import pandas as pd
 
 def preview(session, cleanroom_name):
-    result = {"cleanroom_name": cleanroom_name, "role": "UNKNOWN", "datasets": [], "templates": [], "policies": {"join": [], "column": [], "activation": []}, "consumers": [], "errors": [], "warnings": []}
+    result = {
+        "cleanroom_name": cleanroom_name,
+        "role": "UNKNOWN",
+        "cleanroom_type": "UNKNOWN",
+        "datasets": [],
+        "templates": [],
+        "policies": {"join": [], "column": [], "activation": []},
+        "consumers": [],
+        "freeform_sql": {},
+        "aggregation_policies": [],
+        "errors": [],
+        "warnings": [],
+    }
     
     def fetch_df(query):
         try:
@@ -256,11 +318,100 @@ def preview(session, cleanroom_name):
     result["role"] = "PROVIDER" if is_provider else "CONSUMER"
     result["api_cleanroom_name"] = api
     result["cleanroom_uuid"] = resolved.get("cleanroom_uuid")
+    result["target_uuid"] = resolved.get("cleanroom_uuid") or api
     result["is_ui_cleanroom"] = bool(resolved.get("is_ui_cleanroom"))
     if resolved.get("is_ui_cleanroom"):
         result["warnings"].append(
             "UI cleanroom: migration uses cleanroom UUID for P&C APIs; platform-privacy templates are omitted from generated Collaboration template specs."
         )
+
+    target_uuid = resolved.get("cleanroom_uuid") or api
+    has_ui_freeform = False
+    has_pc_freeform = False
+    if target_uuid:
+        try:
+            sql_t = session.sql(
+                f"SELECT COUNT(*) AS CNT FROM SAMOOHA_CLEANROOM_{target_uuid}.SHARED_SCHEMA.TABLES_ENABLED_FOR_SQL"
+            ).collect()
+            if sql_t and sql_t[0]['CNT'] > 0:
+                has_ui_freeform = True
+                sql_tables_df = fetch_df(
+                    f"SELECT * FROM SAMOOHA_CLEANROOM_{target_uuid}.SHARED_SCHEMA.TABLES_ENABLED_FOR_SQL"
+                )
+                if not sql_tables_df.empty:
+                    result["freeform_sql"]["type"] = "UI_FREEFORM_SQL"
+                    result["freeform_sql"]["tables"] = sql_tables_df.to_dict(orient="records")
+        except Exception:
+            pass
+        try:
+            wf = session.sql(
+                f"SELECT COUNT(*) AS CNT FROM SAMOOHA_CLEANROOM_{target_uuid}.SHARED_SCHEMA.WORKFLOWS_ENABLED "
+                f"WHERE WORKFLOW_NAME = 'freeform_sql'"
+            ).collect()
+            if wf and wf[0]['CNT'] > 0:
+                has_pc_freeform = True
+                wf_tables_df = fetch_df(
+                    f"SELECT * FROM SAMOOHA_CLEANROOM_{target_uuid}.SHARED_SCHEMA.WORKFLOWS_ENABLED_TABLES "
+                    f"WHERE WORKFLOW_NAME = 'freeform_sql'"
+                )
+                wf_consumers_df = fetch_df(
+                    f"SELECT * FROM SAMOOHA_CLEANROOM_{target_uuid}.SHARED_SCHEMA.WORKFLOWS_ENABLED "
+                    f"WHERE WORKFLOW_NAME = 'freeform_sql'"
+                )
+                result["freeform_sql"]["type"] = "PC_FREEFORM_SQL"
+                if not wf_tables_df.empty:
+                    result["freeform_sql"]["tables"] = wf_tables_df.to_dict(orient="records")
+                if not wf_consumers_df.empty:
+                    result["freeform_sql"]["consumers"] = wf_consumers_df.to_dict(orient="records")
+        except Exception:
+            pass
+
+    if resolved.get("is_ui_cleanroom"):
+        result["cleanroom_type"] = "UI_FREEFORM_SQL" if has_ui_freeform else "UI_TEMPLATE_ONLY"
+    else:
+        result["cleanroom_type"] = "PC_FREEFORM_SQL" if has_pc_freeform else "PC_TEMPLATE_ONLY"
+
+    if target_uuid and (has_ui_freeform or has_pc_freeform):
+        try:
+            agg_policies = session.sql(
+                f"SHOW AGGREGATION POLICIES IN SCHEMA SAMOOHA_CLEANROOM_{target_uuid}.SHARED_SCHEMA"
+            ).collect()
+            for ap in agg_policies:
+                ap_d = {k.upper(): v for k, v in ap.as_dict().items()}
+                policy_name = ap_d.get("NAME", "")
+                try:
+                    desc = session.sql(
+                        f"DESCRIBE AGGREGATION POLICY SAMOOHA_CLEANROOM_{target_uuid}.SHARED_SCHEMA.{policy_name}"
+                    ).collect()
+                    if desc:
+                        body = str(
+                            {k.upper(): v for k, v in desc[0].as_dict().items()}.get("BODY", "")
+                        )
+                        m = re.search(r"min_row_count\s*=>\s*(\d+)", body)
+                        threshold = int(m.group(1)) if m else None
+                        result["aggregation_policies"].append(
+                            {"policy_name": policy_name, "body": body, "threshold": threshold}
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if has_pc_freeform:
+            try:
+                for tbl_rec in result.get("freeform_sql", {}).get("tables", []) or []:
+                    table_fqn = tbl_rec.get("TABLE_NAME", "")
+                    if table_fqn:
+                        parts = table_fqn.split(".")
+                        if len(parts) >= 1:
+                            pol_refs = fetch_df(
+                                f"SELECT * FROM TABLE({parts[0]}.INFORMATION_SCHEMA.POLICY_REFERENCES("
+                                f"REF_ENTITY_NAME => '{table_fqn}', REF_ENTITY_DOMAIN => 'TABLE'))"
+                            )
+                            if not pol_refs.empty:
+                                tbl_rec["source_policies"] = pol_refs.to_dict(orient="records")
+            except Exception:
+                pass
 
     try:
         if is_provider:
@@ -782,6 +933,18 @@ def gen_templates(session, cleanroom_name):
         tn_l = str(t_name).lower()
         if 'platform_privacy' in tn_l or 'prod_sql_with_platform_privacy' in tn_l:
             platform_privacy_skipped.append(str(t_name))
+            dp_sens = r.get('DP_SENSITIVITY', 0)
+            specs.append({
+                'template_name': t_name,
+                'classification': 'PLATFORM_PRIVACY',
+                'status': 'REQUIRES_FREEFORM_SQL_MIGRATION',
+                'dp_sensitivity': dp_sens,
+                'warning': (
+                    'This template uses generic_sql_query_with_aggregation_and_projection_policies which is not '
+                    'available in Collaboration APIs. Migrate using freeform SQL data offerings.'
+                ),
+                'original_body': t_sql[:500],
+            })
             continue
 
         if '\\n' in t_sql:
@@ -842,6 +1005,18 @@ def gen_templates(session, cleanroom_name):
 
         params = [normalize_param(p) for p in params]
 
+        t_classification = "CUSTOM_SQL"
+        if is_activation:
+            t_classification = "ACTIVATION"
+        elif any(fn and fn in t_sql for fn in py_fn_names):
+            t_classification = "PYTHON_UDF"
+        elif str(t_name).lower() in (
+            'prod_overlap_analysis',
+            'prod_provider_overlap_analysis',
+            'prod_overlap_analysis_v2',
+        ):
+            t_classification = "STANDARD"
+
         tpl_work = cleaned_sql
         uses_py = bool(py_fn_names) and _template_uses_python_udf(tpl_work, py_fn_names)
         if uses_py:
@@ -869,7 +1044,7 @@ def gen_templates(session, cleanroom_name):
             safe_tpl = tpl_clean.replace("'", "''")
             yaml_out = yaml_header + f"template: '{safe_tpl}'\n"
 
-        specs.append(yaml_out)
+        specs.append({'yaml': yaml_out, 'template_name': t_name, 'classification': t_classification})
     return {
         'templates': specs,
         'python_code_spec': py_code_yaml,
@@ -976,12 +1151,18 @@ def gen_data_offerings(session, cleanroom_name):
     is_provider = resolved.get("role") == "PROVIDER"
     is_consumer = resolved.get("role") == "CONSUMER"
 
-    tables_data = [] 
+    tables_data = []
     join_df = pd.DataFrame()
     col_df = pd.DataFrame()
     act_df = pd.DataFrame()
     prov_join_df = pd.DataFrame()
     prov_col_df = pd.DataFrame()
+    uuid = None
+    has_ui_freeform = False
+    has_pc_freeform = False
+    agg_policy_map = {}
+    ui_sql_tables = set()
+    pc_sql_tables = set()
 
     if is_provider:
         prov_res = session.sql(f"CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.PROVIDER.view_provider_datasets('{api_esc}')").collect()
@@ -991,7 +1172,7 @@ def gen_data_offerings(session, cleanroom_name):
                 t_name = d.get('TABLE_NAME')
                 if t_name:
                     tables_data.append({'TABLE_NAME': t_name, 'SQL_ENABLED': d.get('SQL_ENABLED', False)})
-        
+
         cr = session.sql(
             f"SELECT * FROM SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.PUBLIC.CLEANROOM_RECORD WHERE "
             f"UPPER(REPLACE(TRIM(COALESCE(CLEANROOM_ID::STRING, '')), ' ', '_')) = UPPER(REPLACE(TRIM('{api_esc}'), ' ', '_')) "
@@ -1002,13 +1183,93 @@ def gen_data_offerings(session, cleanroom_name):
             uuid = cr_dict.get('CLEANROOM_ID') or cr_dict.get('ID') or cr_dict.get('CLEANROOM_UUID')
             if not uuid:
                 for k, v in cr_dict.items():
-                    if 'ID' in k and 'SIDE' not in k: uuid = v; break
-            
+                    if 'ID' in k and 'SIDE' not in k:
+                        uuid = v
+                        break
+
             if uuid:
                 join_df = get_df_upper(f"SELECT * FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.JOIN_COLUMNS")
                 col_df = get_df_upper(f"SELECT * FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.POLICY_COLUMNS")
-                try: act_df = get_df_upper(f"SELECT * FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.ACTIVATION_COLUMNS")
-                except: pass
+                try:
+                    act_df = get_df_upper(f"SELECT * FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.ACTIVATION_COLUMNS")
+                except Exception:
+                    pass
+
+        if uuid:
+            try:
+                sql_t = session.sql(
+                    f"SELECT COUNT(*) AS CNT FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.TABLES_ENABLED_FOR_SQL"
+                ).collect()
+                if sql_t and sql_t[0]['CNT'] > 0:
+                    has_ui_freeform = True
+            except Exception:
+                pass
+            try:
+                wf = session.sql(
+                    f"SELECT COUNT(*) AS CNT FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.WORKFLOWS_ENABLED "
+                    f"WHERE WORKFLOW_NAME = 'freeform_sql'"
+                ).collect()
+                if wf and wf[0]['CNT'] > 0:
+                    has_pc_freeform = True
+            except Exception:
+                pass
+
+            if has_ui_freeform:
+                try:
+                    agg_pols = session.sql(
+                        f"SHOW AGGREGATION POLICIES IN SCHEMA SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA"
+                    ).collect()
+                    for ap in agg_pols:
+                        ap_d = {k.upper(): v for k, v in ap.as_dict().items()}
+                        pol_name = ap_d.get('NAME', '')
+                        try:
+                            desc = session.sql(
+                                f"DESCRIBE AGGREGATION POLICY SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.{pol_name}"
+                            ).collect()
+                            if desc:
+                                body = str(
+                                    {k.upper(): v for k, v in desc[0].as_dict().items()}.get('BODY', '')
+                                )
+                                m = re.search(r'min_row_count\s*=>\s*(\d+)', body)
+                                threshold = int(m.group(1)) if m else 5
+                                table_suffix = re.sub(r'^AGG\d+_', '', pol_name)
+                                agg_policy_map[table_suffix.upper()] = {
+                                    'threshold': threshold,
+                                    'policy_name': pol_name,
+                                    'body': body,
+                                }
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            if has_ui_freeform:
+                try:
+                    sql_t_df = get_df_upper(
+                        f"SELECT * FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.TABLES_ENABLED_FOR_SQL"
+                    )
+                    if not sql_t_df.empty:
+                        for _, row in sql_t_df.iterrows():
+                            ui_sql_tables.add(str(row.get('TABLE_NAME', '')).upper())
+                except Exception:
+                    pass
+
+            if has_pc_freeform:
+                try:
+                    wf_t_df = get_df_upper(
+                        f"SELECT * FROM SAMOOHA_CLEANROOM_{uuid}.SHARED_SCHEMA.WORKFLOWS_ENABLED_TABLES "
+                        f"WHERE WORKFLOW_NAME = 'freeform_sql'"
+                    )
+                    if not wf_t_df.empty:
+                        for _, row in wf_t_df.iterrows():
+                            pc_sql_tables.add(str(row.get('TABLE_NAME', '')).upper())
+                except Exception:
+                    pass
+
+            for t_data in tables_data:
+                tn_upper = t_data['TABLE_NAME'].upper()
+                if tn_upper in ui_sql_tables or tn_upper in pc_sql_tables:
+                    t_data['SQL_ENABLED'] = True
     elif is_consumer:
         cons_res = session.sql(f"CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.CONSUMER.view_consumer_datasets('{api_esc}')").collect()
         if cons_res:
@@ -1183,22 +1444,55 @@ def gen_data_offerings(session, cleanroom_name):
         
         dataset_obj = {
             'alias': safe_name,
-            'data_object_fqn': t_name, 
+            'data_object_fqn': t_name,
             'allowed_analyses': 'template_and_freeform_sql' if t_data.get('SQL_ENABLED') else 'template_only',
-            'object_class': 'custom', 
-            'schema_and_template_policies': schema_policies
+            'object_class': 'custom',
+            'schema_and_template_policies': schema_policies,
         }
-        
+
+        migration_note = ""
         if t_data.get('SQL_ENABLED'):
-            dataset_obj['freeform_sql_policies'] = {}
+            freeform_policies = {}
+            table_suffix_key = t_name.replace('.', '__').upper()
+            matched_agg = None
+            for suffix, pol_info in agg_policy_map.items():
+                if suffix.upper() in table_suffix_key or table_suffix_key in suffix.upper():
+                    matched_agg = pol_info
+                    break
+            if matched_agg:
+                threshold = matched_agg['threshold']
+                join_cols_for_entity = [
+                    c for c in schema_policies if schema_policies[c].get('category') == 'join_standard'
+                ]
+                freeform_policies['aggregation_policy'] = {'name': f"PLACEHOLDER_AGG_POLICY_{threshold}"}
+                if join_cols_for_entity:
+                    freeform_policies['aggregation_policy']['entity_keys'] = join_cols_for_entity
+                migration_note = (
+                    f"Create aggregation policy with MIN_GROUP_SIZE => {threshold} before registering. "
+                    f"Original: {matched_agg['policy_name']} ({matched_agg['body']})"
+                )
+            elif has_pc_freeform:
+                migration_note = (
+                    "P&C freeform SQL: policies are on source tables. Use POLICY_REFERENCES() to extract "
+                    "and reference them in freeform_sql_policies."
+                )
+
+            if freeform_policies:
+                dataset_obj['freeform_sql_policies'] = freeform_policies
             dataset_obj['require_freeform_sql_policy'] = False
 
         spec = {
-            'api_version': '2.0.0', 'spec_type': 'data_offering', 'name': safe_name,
-            'version': ver_str, 'description': f"Migrated {t_name}",
-            'datasets': [dataset_obj]
+            'api_version': '2.0.0',
+            'spec_type': 'data_offering',
+            'name': safe_name,
+            'version': ver_str,
+            'description': f"Migrated {t_name}",
+            'datasets': [dataset_obj],
         }
-        specs.append(yaml.dump(spec, default_flow_style=False, sort_keys=False))
+        yaml_str = yaml.dump(spec, default_flow_style=False, sort_keys=False)
+        if t_data.get('SQL_ENABLED') and migration_note:
+            yaml_str = f"# NOTE: {migration_note}\n" + yaml_str
+        specs.append(yaml_str)
     return specs
 $$;
 
@@ -1262,16 +1556,23 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
 
     cons_acct = "CONSUMER_ACCOUNT"
     consumer_resolved = False
+    all_consumers = []
     try:
         cons_res = session.sql(f"CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.PROVIDER.VIEW_CONSUMERS('{api_esc}')").collect()
         if cons_res:
-            c_dict = {k.upper(): v for k, v in cons_res[0].as_dict().items()}
-            for k,v in c_dict.items():
-                if ('NAME' in k or 'ACCOUNT' in k) and v:
-                    cons_acct = str(v)
-                    consumer_resolved = True
-                    break
-    except:
+            for cr_row in cons_res:
+                c_dict = {k.upper(): v for k, v in cr_row.as_dict().items()}
+                acct_val = None
+                for k, v in c_dict.items():
+                    if ('NAME' in k or 'ACCOUNT' in k) and v:
+                        acct_val = str(v)
+                        break
+                if acct_val and acct_val not in all_consumers:
+                    all_consumers.append(acct_val)
+            if all_consumers:
+                cons_acct = all_consumers[0]
+                consumer_resolved = True
+    except Exception:
         pass
 
     if not consumer_resolved or cons_acct == "CONSUMER_ACCOUNT" or '.' not in cons_acct:
@@ -1301,6 +1602,40 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
         if enable_activation:
             runner_config['activation_destinations'] = {'snowflake_collaborators': ['Provider_Account']}
         runners['Provider_Account'] = runner_config
+    elif len(all_consumers) > 1:
+        for i, c_acct in enumerate(all_consumers):
+            c_alias = "Consumer_%d" % (i + 1)
+            cons_dp = {
+                'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]},
+                c_alias: {'data_offerings': []},
+            }
+            cons_runner_config = {
+                'templates': [{'id': x} for x in temp_ids],
+                'data_providers': cons_dp,
+            }
+            if enable_activation:
+                cons_runner_config['activation_destinations'] = {'snowflake_collaborators': [c_alias]}
+            runners[c_alias] = cons_runner_config
+
+        can_prov_run = False
+        try:
+            res = session.sql(
+                f"CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.LIBRARY.IS_PROVIDER_RUN_ENABLED('{api_esc}')"
+            ).collect()
+            if res:
+                val = str(res[0][0]).lower()
+                if "provider side run analysis is enabled" in val:
+                    can_prov_run = True
+        except Exception:
+            pass
+        if can_prov_run:
+            prov_dp = {'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]}}
+            for i in range(len(all_consumers)):
+                prov_dp["Consumer_%d" % (i + 1)] = {'data_offerings': []}
+            runners['Provider_Account'] = {
+                'templates': [{'id': x} for x in temp_ids],
+                'data_providers': prov_dp,
+            }
     else:
         # Consumer_Account runner must list BOTH collaborators' offerings: provider data (e.g. CUSTOMERS)
         # and consumer data (e.g. labels / my_table). Previously only Provider_Account appeared, which made
@@ -1367,6 +1702,18 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
                 'Provider_Account': prov_acct
             }
         }
+    elif len(all_consumers) > 1:
+        alias_map = {'Provider_Account': prov_acct}
+        for i, c_acct in enumerate(all_consumers):
+            resolved_c = c_acct
+            if '.' not in resolved_c:
+                try:
+                    curr_org = session.sql("SELECT CURRENT_ORGANIZATION_NAME()").collect()[0][0]
+                    resolved_c = "%s.%s" % (curr_org, c_acct)
+                except Exception:
+                    pass
+            alias_map["Consumer_%d" % (i + 1)] = resolved_c
+        aliases = {'collaborator_identifier_aliases': alias_map}
     else:
         aliases = {
             'collaborator_identifier_aliases': {
@@ -1749,8 +2096,10 @@ def agent_main(session, cleanroom_name, action_mode):
         except: pass
 
         check = session.call("DCR_SNOWVA.MIGRATION.CHECK_PREREQUISITES", cleanroom_name)
-        if isinstance(check, str): check = json.loads(check)
+        if isinstance(check, str):
+            check = json.loads(check)
         prereq_warnings = check.get('warnings', [])
+        cleanroom_type = check.get('cleanroom_type', 'UNKNOWN') if isinstance(check, dict) else 'UNKNOWN'
         if check.get('status') == 'FAIL':
              errors = check.get('errors', [])
              msg = " | ".join(errors) if errors else "Prerequisites check failed."
@@ -1804,8 +2153,13 @@ def agent_main(session, cleanroom_name, action_mode):
             py_code_spec = _tpack.get('python_code_spec')
             py_udf_names = _tpack.get('python_udf_names', [])
             py_stage_files = _tpack.get('python_stage_files', [])
-        platform_pp = _tpack.get('platform_privacy_skipped', []) if isinstance(_tpack, dict) else []
-        
+        platform_pp = list(_tpack.get('platform_privacy_skipped', [])) if isinstance(_tpack, dict) else []
+        for t in tmps:
+            if isinstance(t, dict) and t.get('classification') == 'PLATFORM_PRIVACY':
+                tn = t.get('template_name')
+                if tn and tn not in platform_pp:
+                    platform_pp.append(tn)
+
         res_dos = session.call("DCR_SNOWVA.MIGRATION.GENERATE_DATA_OFFERING_SPECS", cleanroom_name)
         dos = json.loads(res_dos) if isinstance(res_dos, str) else res_dos
 
@@ -1817,6 +2171,7 @@ def agent_main(session, cleanroom_name, action_mode):
         script_lines.append("USE ROLE SAMOOHA_APP_ROLE;")
         script_lines.append("USE SECONDARY ROLES NONE;")
         script_lines.append(f"-- MIGRATION SCRIPT FOR: {cleanroom_name} ({role_type})")
+        script_lines.append(f"-- Cleanroom type: {cleanroom_type}")
         script_lines.append("-- Generated via DCR_SNOWVA.MIGRATION Package\n")
 
         step_n = 0
@@ -1827,10 +2182,31 @@ def agent_main(session, cleanroom_name, action_mode):
             step_n = 1
 
         if tmps:
-            script_lines.append(f"-- [{step_n}] REGISTER TEMPLATES ({len(tmps)} found)")
-            for y_str in tmps:
-                script_lines.append(f"CALL samooha_by_snowflake_local_db.registry.register_template({dd}\n{y_str}\n{dd});\n")
-            step_n += 1
+            platform_privacy_tmps = [
+                t for t in tmps if isinstance(t, dict) and t.get('classification') == 'PLATFORM_PRIVACY'
+            ]
+            normal_tmps = [
+                t for t in tmps if not (isinstance(t, dict) and t.get('classification') == 'PLATFORM_PRIVACY')
+            ]
+
+            if platform_privacy_tmps:
+                script_lines.append("\n-- WARNING: %d platform privacy template(s) detected." % len(platform_privacy_tmps))
+                script_lines.append("-- These use generic_sql_query_with_aggregation_and_projection_policies (not in Collaboration APIs).")
+                script_lines.append("-- Use freeform SQL data offerings (see registered offerings below).")
+                for pp in platform_privacy_tmps:
+                    script_lines.append(
+                        "-- SKIPPED: %s (PLATFORM_PRIVACY)" % pp.get('template_name', 'unknown')
+                    )
+                script_lines.append("")
+
+            if normal_tmps:
+                script_lines.append(f"-- [{step_n}] REGISTER TEMPLATES ({len(normal_tmps)} found)")
+                for t_entry in normal_tmps:
+                    y_str = t_entry.get('yaml', '') if isinstance(t_entry, dict) else str(t_entry)
+                    script_lines.append(
+                        f"CALL samooha_by_snowflake_local_db.registry.register_template({dd}\n{y_str}\n{dd});\n"
+                    )
+                step_n += 1
 
         if dos:
             script_lines.append(f"\n-- [{step_n}] REGISTER DATA OFFERINGS ({len(dos)} found)")
@@ -1857,7 +2233,10 @@ def agent_main(session, cleanroom_name, action_mode):
 
              tmp_ids = []
              has_activation = False
-             for y_str in tmps:
+             for t_entry in tmps:
+                if isinstance(t_entry, dict) and t_entry.get('classification') == 'PLATFORM_PRIVACY':
+                    continue
+                y_str = t_entry.get('yaml', '') if isinstance(t_entry, dict) else str(t_entry)
                 spec = yaml.safe_load(y_str)
                 t_id = f"{spec['name']}_{spec['version']}"
                 tmp_ids.append(t_id)
@@ -1958,7 +2337,11 @@ def agent_main(session, cleanroom_name, action_mode):
         full_script_text = "\n".join(script_lines)
 
         if action == 'PLAN':
-            t_count = len(tmps) if tmps else 0
+            registerable_tmps = [
+                t for t in (tmps or [])
+                if not (isinstance(t, dict) and t.get('classification') == 'PLATFORM_PRIVACY')
+            ]
+            t_count = len(registerable_tmps)
             d_count = len(dos) if dos else 0
             py_note = ""
             if py_udf_names:
@@ -1990,6 +2373,7 @@ def agent_main(session, cleanroom_name, action_mode):
                     "platform_privacy_skipped": platform_pp,
                     "api_cleanroom_name": api_cr,
                     "is_ui_cleanroom": bool(resolved_r.get("is_ui_cleanroom")),
+                    "cleanroom_type": cleanroom_type,
                 }
             }
             if prereq_warnings:
@@ -2010,11 +2394,18 @@ def agent_main(session, cleanroom_name, action_mode):
                         raise e
             
             if tmps:
-                for y_str in tmps:
+                for t_entry in tmps:
+                    if isinstance(t_entry, dict) and t_entry.get('classification') == 'PLATFORM_PRIVACY':
+                        actions_taken.append(
+                            "Skipped platform privacy template: %s (use freeform data offerings)"
+                            % t_entry.get('template_name', 'unknown')
+                        )
+                        continue
+                    y_str = t_entry.get('yaml', '') if isinstance(t_entry, dict) else str(t_entry)
                     try:
                         spec = yaml.safe_load(y_str)
                         t_name = spec.get('name', 'unknown')
-                    except:
+                    except Exception:
                         t_name = 'unknown'
                     try:
                         session.call("SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.REGISTRY.REGISTER_TEMPLATE", y_str)
@@ -2022,7 +2413,8 @@ def agent_main(session, cleanroom_name, action_mode):
                     except Exception as e:
                         if "already exists" in str(e).lower():
                             actions_taken.append(f"Template already registered (skipped): {t_name}")
-                        else: raise e
+                        else:
+                            raise e
             
             if dos:
                 for y_str in dos:
