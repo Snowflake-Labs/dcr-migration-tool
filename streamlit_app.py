@@ -16,6 +16,7 @@
 import streamlit as st
 import snowflake.snowpark as snowpark
 import json
+import re
 import pandas as pd
 import time
 from snowflake.snowpark.context import get_active_session
@@ -72,7 +73,6 @@ def _looks_like_uuid(name):
     """Check if a cleanroom name looks like an internal UUID rather than a human-readable name."""
     if not name:
         return True
-    import re
     clean = name.replace('-', '').replace('_', '').strip()
     if re.fullmatch(r'[0-9a-fA-F]{20,}', clean):
         return True
@@ -135,11 +135,24 @@ def list_collab_dcrs():
                 continue
             seen[cr.upper()] = True
 
-            collab_name = f"migrated_{cr}"
+            collab_name = f"migrated_{re.sub(r'[^a-zA-Z0-9]', '', cr)[:56] or 'cleanroom'}"
+            try:
+                rsv = session.call("DCR_SNOWVA.MIGRATION.RESOLVE_CLEANROOM_FOR_MIGRATION", cr)
+                if isinstance(rsv, str):
+                    try:
+                        rsv = json.loads(rsv)
+                    except Exception:
+                        rsv = {}
+                if isinstance(rsv, dict) and rsv.get("status") == "OK":
+                    uid = rsv.get("cleanroom_uuid") or rsv.get("api_cleanroom_name") or cr
+                    collab_name = f"migrated_{re.sub(r'[^a-zA-Z0-9]', '', str(uid))[:56] or 'cleanroom'}"
+            except Exception:
+                pass
             status = ''
+            safe_collab = collab_name.replace("'", "''")
             try:
                 st_res = session.sql(
-                    f"CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.COLLABORATION.GET_STATUS('{collab_name}')"
+                    f"CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.COLLABORATION.GET_STATUS('{safe_collab}')"
                 ).collect()
                 if st_res:
                     row = {k.upper(): v for k, v in st_res[0].as_dict().items()}
@@ -174,9 +187,10 @@ def get_migration_plan(cleanroom_name):
         if plan.get("status") == "ERROR":
             msg = plan.get('message', '')
             if "not found" in msg.lower() or "not installed" in msg.lower() or "CleanroomNotInstalled" in msg:
-                st.error(f"Cleanroom '{cleanroom_name}' was not found. Please verify the cleanroom name is correct (use the P&C API name, not a UUID). Use the 'List Cleanrooms' button to see available rooms.")
-            elif "ui-created" in msg.lower() or "ui cleanroom" in msg.lower():
-                st.error(f"Cleanroom '{cleanroom_name}' is a UI-created cleanroom. Migration of UI cleanrooms is not supported in this release.")
+                st.error(
+                    f"Cleanroom '{cleanroom_name}' was not found. Use the display name or cleanroom UUID from "
+                    "'List Cleanrooms', or the consumer install UUID. Provider UI cleanrooms accept the human-readable name."
+                )
             elif "laf" in msg.lower():
                 st.error(f"Cleanroom '{cleanroom_name}' uses LAF (Cross-Cloud Auto-Fulfillment). LAF cleanroom migration is not supported.")
             elif "prerequisites" in msg.lower():
@@ -189,6 +203,12 @@ def get_migration_plan(cleanroom_name):
             return None
         
         plan['cleanroom_name'] = cleanroom_name
+        det = plan.get('details') or {}
+        if det.get('is_ui_cleanroom'):
+            st.info(
+                "UI cleanroom: the collaboration will be named from the cleanroom id. "
+                "Platform-privacy templates listed under details are not auto-migrated as template specs."
+            )
         return plan
     except Exception as e:
         st.error(f"Orchestration Error: {e}")
@@ -430,6 +450,12 @@ else:
     for w in plan.get('warnings', []):
         st.warning(w)
 
+    notes = plan.get("migration_notes") or []
+    if notes:
+        with st.expander("Migration notes (legal terms, limits, freeform SQL)", expanded=False):
+            for n in notes:
+                st.markdown(f"- {n}")
+
     if details.get("has_python_code_spec"):
         udfs = details.get("python_udf_names") or []
         st.success(
@@ -505,7 +531,13 @@ else:
     # 3. FINALIZE
     with tabs[2]:
         st.subheader("Phase 2: Finalize")
-        
+        st.warning(
+            "**Worksheet required for some steps:** `collaboration.initialize` and `collaboration.join` invoke "
+            "`SYSTEM$ACCEPT_LEGAL_TERMS`, which **does not run** inside Streamlit or inside the migration stored procedure. "
+            "If **Check Status** or **Run Setup** points you here with a FAIL/hint about legal terms or side effects, "
+            "run the **Review Plan** SQL (or the snippet below) in a **Snowflake SQL Worksheet** as `SAMOOHA_APP_ROLE`."
+        )
+
         final_sql, _ = get_manual_sql_scripts(plan)
         
         col1, col2 = st.columns(2)
@@ -525,6 +557,10 @@ else:
                         st.error(f"Status: **{status}**")
                         if res.get("hint"):
                             st.warning(res["hint"])
+                            if "legal" in res["hint"].lower() or "accept_legal" in res["hint"].lower():
+                                st.info(
+                                    "Open **Worksheets**, run **initialize** / **join** there, then return and **Check Status** again."
+                                )
                     elif status == 'CREATING':
                         st.info(f"Status: **{status}** - Still creating. Check again in a few seconds.")
                     else:
@@ -550,6 +586,10 @@ else:
                     st.error(f"Check Failed: {res.get('message')}")
                     if res.get("hint"):
                         st.info(res["hint"])
+                        if "legal" in str(res.get("hint", "")).lower() or "accept_legal" in str(res.get("hint", "")).lower():
+                            st.info(
+                                "Use a **SQL Worksheet** (not this app) for steps that require `SYSTEM$ACCEPT_LEGAL_TERMS`."
+                            )
 
         # Join - must be done manually due to SYSTEM$ACCEPT_LEGAL_TERMS restriction
         collab_name = st.session_state.get('collab_name', plan.get('details', {}).get('target_collaboration', ''))
@@ -671,6 +711,11 @@ else:
                 status = report.get('overall_status', 'UNKNOWN')
                 if status == "PASS":
                     st.success("Validation Passed: All objects match between legacy and new collaboration.")
+                elif status == "WARN":
+                    st.warning(
+                        "Validation completed with **warnings** (e.g. platform-privacy / freeform expectations). "
+                        "Review the table and remediation below."
+                    )
                 else:
                     st.error(f"Validation Status: {status}")
                     if report.get('error'):

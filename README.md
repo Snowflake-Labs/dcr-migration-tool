@@ -36,8 +36,9 @@ The DCR Migration Tool is an automated engine that upgrades legacy P&C API clean
 - **Spec Generation** — Converts legacy SQL templates and table policies into v2.0 compliant YAML specs with literal block style for readability.
 - **Smart Column Type Detection** — Recognizes common join column abbreviations (`HEM`, `HPN`, `IDFA`, etc.) and maps them to valid Snowflake `column_type` identifiers.
 - **Python Cleanroom & UDF Migration** — Reads `SAMOOHA_CLEANROOM_<id>.SHARED_SCHEMA.LOAD_PYTHON_RECORD` and lists `@APP.CODE/V1_0P1`. Matches both P&C flows from [Use Python in a clean room](https://docs.snowflake.com/en/user-guide/cleanrooms/provider#use-python-in-a-clean-room): **inline** `load_python_into_cleanroom` (BODY → `code_body`) and **stage** overload (`imports` in metadata → Collaboration `artifacts` + per-function `imports`, see [custom functions](https://docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions)). Stage paths default to `@SAMOOHA_CLEANROOM_<id>.APP.CODE/<patch>/…` with `<patch>` inferred from stage listings or `V1_0P1`. You remain responsible for Collaboration stage rules (internal stage, `DIRECTORY`, `SNOWFLAKE_SSE`, etc.). Rewrites template SQL to `cleanroom.<migrated_py_spec>$<udf>(` and registers templates with `code_specs` linkage. Requires Data Clean Rooms 12.9+ for custom functions.
-- **Safety Guardrails** — Pre-flight checks block unsupported configurations (multi-provider, LAF, UI-created cleanrooms).
-- **Deterministic Versioning** — Provider and Consumer generate matching artifact IDs without manual coordination.
+- **UI cleanrooms** — Cleanrooms created in the Snowflake UI have a human-readable name distinct from the cleanroom id. The tool resolves either name or id via `RESOLVE_CLEANROOM_FOR_MIGRATION`, uses the **id** for all P&C API calls, and names the Collaboration `migrated_<alphanumeric_id>`. Platform-privacy SQL templates (name contains `platform_privacy` / `prod_sql_with_platform_privacy`) are skipped in generated template specs; validate parity and data offerings accordingly.
+- **Safety Guardrails** — Pre-flight checks block unsupported configurations (multi-provider, LAF).
+- **Deterministic Versioning** — Provider and consumer artifact IDs use a shared suffix (currently **`MIGRATION_V2`**) so template, data offering, and collaboration registrations stay aligned.
 - **Parity Validation** — Compares the new Collaboration against the legacy Cleanroom to verify template and data offering coverage.
 - **Audit Logging** — Every migration run is logged to `MIGRATION_JOBS` with job ID, timestamps, status, and details.
 - **Migration History** — "Migrated DCRs" view shows all past migrations with live collaboration status and job metadata.
@@ -69,6 +70,24 @@ The DCR Migration Tool is an automated engine that upgrades legacy P&C API clean
 4. Click **Run All**.
 
 This creates the `DCR_SNOWVA.MIGRATION` schema with all stored procedures and the `MIGRATION_JOBS` audit table.
+
+### Stored procedure entry points
+
+| Procedure | Purpose |
+|-----------|---------|
+| **`AGENT_MIGRATE_ORCHESTRATOR(cleanroom_name, action_mode)`** | **Primary** orchestration entry. `action_mode`: `PLAN`, `EXECUTE`, `JOIN`, `CHECK_STATUS`, `VALIDATE`, `TEARDOWN`. Accepts legacy **name or UUID**; resolution uses `RESOLVE_CLEANROOM_FOR_MIGRATION` internally. |
+| **`UI_MIGRATE_ORCHESTRATOR(cleanroom_id, action_mode)`** | **Alias** of the agent orchestrator (same arguments and return shape). Use when calling from SQL/docs that refer to “UI” cleanroom id. |
+| **`RESOLVE_CLEANROOM_FOR_MIGRATION(cleanroom_name)`** | Returns JSON with `api_cleanroom_name`, `cleanroom_uuid`, `is_ui_cleanroom`, etc. Used by the Streamlit “Migrated DCRs” list and by several generator procedures. |
+| Other `DCR_SNOWVA.MIGRATION.*` procedures | Building blocks (`CHECK_PREREQUISITES`, `PREVIEW`, `GENERATE_*`, `VALIDATE`, …) callable directly for advanced use. |
+
+**Resolution strategy:** The backend standardizes on **`RESOLVE_CLEANROOM_FOR_MIGRATION`** so human-readable UI names and UUIDs both map to the **cleanroom id** used in P&C API calls. Avoid duplicating that logic in clients when possible.
+
+### Known limitations (manual follow-up)
+
+- **Legal terms:** `SYSTEM$ACCEPT_LEGAL_TERMS` runs during collaboration **initialize** / **join**; it **cannot** run inside Streamlit or inside a stored procedure. Use a **SQL Worksheet** with the generated script when the app reports that hint.
+- **Template chains:** Legacy `add_template_chain` is **not** migrated; flatten into separate templates or handle outside the tool.
+- **Differential privacy / platform privacy:** Semantics may **differ** from legacy; review YAML. Platform-privacy templates are **skipped** as Collaboration templates; parity validation checks for **freeform-enabled** offerings when those templates existed.
+- **Aggregation policies:** Creating policies for freeform SQL may require **elevated privileges** (e.g. ACCOUNTADMIN).
 
 ### 2. Deploy the Streamlit App
 
@@ -120,11 +139,11 @@ You have two options:
 
 ### Phase 3: Finalize (Join)
 
-1. Go to the **Finalize (Join)** tab.
+1. Go to the **Finalize (Join)** tab and read the **worksheet / legal terms** banner (initialize and join often must run outside Streamlit).
 2. Click **Check Status** until the collaboration status returns `CREATED` or `INVITED`.
-3. Copy the provided JOIN SQL and run it in a **Snowflake SQL Worksheet**.
+3. Copy the provided JOIN SQL (or the full script from **Review Plan**) and run it in a **Snowflake SQL Worksheet** as `SAMOOHA_APP_ROLE`.
 
-> **Note:** The JOIN command requires `SYSTEM$ACCEPT_LEGAL_TERMS` which cannot execute from within Streamlit. The UI provides a ready-to-paste SQL snippet.
+> **Note:** `SYSTEM$ACCEPT_LEGAL_TERMS` is invoked during **initialize** and **join**; it cannot run inside Streamlit or inside the migration procedure. The UI surfaces hints when **Check Status** detects related failures.
 
 > **Note:** If JOIN fails with `ReferenceUsageGrantMissingException`, an ACCOUNTADMIN must grant `REFERENCE_USAGE` on the relevant database to the share name shown in the error. See the warning in the Finalize tab for the exact command.
 
@@ -166,6 +185,8 @@ If a collaboration ends up in a bad state (`JOIN_FAILED`, etc.):
 | `No data offerings found` (Consumer) | Normal for consumer-only migrations | The tool skips data registration and proceeds to joining |
 | Collaboration spec shows empty `Consumer_Account` data offerings | Provider migration cannot register the consumer’s table | Expected: consumer runs **Generate Plan** in the **consumer** account, registers their data offering, then `link_data_offering` so `my_table` appears in the spec (lookalike-style templates need both sides) |
 | Parity check shows "Missing templates" | Templates registered but not found in collaboration | Check the diagnostic output; may need to teardown and re-create the collaboration |
+| Validation **WARN** (platform privacy / freeform) | Legacy had `prod_sql_with_platform_privacy_*` templates | Ensure provider data offerings use `allowed_analyses: template_and_freeform_sql` (or equivalent); re-register offerings if needed |
+| `already exists` with wrong version suffix | Account still has artifacts from an older tool version | This repo registers **`MIGRATION_V2`** IDs; either teardown and re-migrate or keep using the version your account already has |
 | Python UDF not in generated script | UDF missing from `LOAD_PYTHON_RECORD` | Only UDFs in `LOAD_PYTHON_RECORD` are migrated to `REGISTER_CODE_SPEC`; re-run legacy `load_python_into_cleanroom` or add the UDF manually per [custom functions](https://docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions) |
 | `SpecValidationError` on `register_code_spec` (YAML / `code_body`) | Block-scalar indentation or bad parse of stored `BODY` | The generator dedents Python from `LOAD_PYTHON_RECORD` and parses handler params (incl. type hints) so names align with `arguments`; if it still fails, compare generated YAML to [custom functions](https://docs.snowflake.com/en/user-guide/cleanrooms/v2/custom-functions) |
 
