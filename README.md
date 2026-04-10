@@ -75,12 +75,29 @@ This creates the `DCR_SNOWVA.MIGRATION` schema with all stored procedures and th
 
 | Procedure | Purpose |
 |-----------|---------|
-| **`AGENT_MIGRATE_ORCHESTRATOR(cleanroom_name, action_mode)`** | **Primary** orchestration entry. `action_mode`: `PLAN`, `EXECUTE`, `JOIN`, `CHECK_STATUS`, `VALIDATE`, `TEARDOWN`. Accepts legacy **name or UUID**; resolution uses `RESOLVE_CLEANROOM_FOR_MIGRATION` internally. |
+| **`AGENT_MIGRATE_ORCHESTRATOR(cleanroom_name, action_mode)`** | **Primary** orchestration entry. `action_mode`: `PLAN`, `EXECUTE`, `JOIN`, `CHECK_STATUS`, `VALIDATE`, `TEARDOWN`. Accepts legacy **name or UUID**; resolution uses `RESOLVE_CLEANROOM_FOR_MIGRATION` internally. Sets Snowflake **QUERY_TAG** (`dcr_migration_tool:v3.0:…`) during actions for observability. Generated worksheets use **`collaboration.initialize(..., 'APP_WH')`**, **`enable_template_auto_approval`**, and commented **`add_template_request`** / dual-collaborator **`link_data_offering`** where applicable. |
 | **`UI_MIGRATE_ORCHESTRATOR(cleanroom_id, action_mode)`** | **Alias** of the agent orchestrator (same arguments and return shape). Use when calling from SQL/docs that refer to “UI” cleanroom id. |
 | **`RESOLVE_CLEANROOM_FOR_MIGRATION(cleanroom_name)`** | Returns JSON with `api_cleanroom_name`, `cleanroom_uuid`, `is_ui_cleanroom`, etc. Used by the Streamlit “Migrated DCRs” list and by several generator procedures. |
 | Other `DCR_SNOWVA.MIGRATION.*` procedures | Building blocks (`CHECK_PREREQUISITES`, `PREVIEW`, `GENERATE_*`, `VALIDATE`, …) callable directly for advanced use. |
 
 **Resolution strategy:** The backend standardizes on **`RESOLVE_CLEANROOM_FOR_MIGRATION`** so human-readable UI names and UUIDs both map to the **cleanroom id** used in P&C API calls. Avoid duplicating that logic in clients when possible.
+
+### Standalone reference SQL vs this `migration-backend.sql`
+
+You may have a **pasted** script that looks similar but differs line-by-line from the repo. Most gaps are **intentional** so UI cleanrooms, Streamlit, and Collaboration names stay consistent.
+
+| Area | Typical pasted snippet | This repository |
+|------|-------------------------|-----------------|
+| **Discovery** | `VIEW_CLEANROOMS` / `IS_ENABLED` inlined in each procedure | **`RESOLVE_CLEANROOM_FOR_MIGRATION`** centralizes match + **CREATED** check for providers |
+| **Collaboration name** | `migrated_{display_name_with_underscores}` | **`migrated_{sanitized_cleanroom_id}`** (alphanumeric UUID) — matches generated YAML, `get_status`, and Streamlit |
+| **CHECK / LAF** | `IS_LAF_ENABLED_FOR_CLEANROOM` with **display name** | Uses **`api` / cleanroom id** after resolve; provider + consumer LAF attempts |
+| **VALIDATE** | P&C calls with raw input; parity counts all legacy templates | Uses **resolved `api`**; **skips** platform-privacy templates in template parity; **platform privacy / freeform** check; **WARN** status |
+| **GENERATE_ANALYSIS_SCRIPT** | `MIGRATION_V1`, collab from human string | **`MIGRATION_V2`**, collaboration id from **UUID suffix** |
+| **`gen_templates` errors** | `return []` when no rows | Returns **`{ "templates": [], ... }`** (VARIANT object) |
+| **PLAN summary** | `len(tmps)` includes `PLATFORM_PRIVACY` dict rows | Counts **registerable** templates only; **`migration_notes`**; merged **`platform_privacy_skipped`** |
+| **`GENERATE_COLLABORATION_SPEC`** | `CLEANROOM_RECORD` with simple `UPPER(name)` | **Normalized** name/id + **`RESOLVE`**-aligned **`api_esc`**; **multi-consumer** runners when `VIEW_CONSUMERS` returns many rows |
+
+**Do not** “align” the repo to a snippet by switching collaboration naming back to the human-readable string or removing **`RESOLVE_*`** without also updating **Streamlit** and re-testing UI cleanrooms end-to-end.
 
 ### Known limitations (manual follow-up)
 
