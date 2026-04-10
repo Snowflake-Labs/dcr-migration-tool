@@ -135,19 +135,7 @@ def list_collab_dcrs():
                 continue
             seen[cr.upper()] = True
 
-            collab_name = f"migrated_{re.sub(r'[^a-zA-Z0-9]', '', cr)[:56] or 'cleanroom'}"
-            try:
-                rsv = session.call("DCR_SNOWVA.MIGRATION.RESOLVE_CLEANROOM_FOR_MIGRATION", cr)
-                if isinstance(rsv, str):
-                    try:
-                        rsv = json.loads(rsv)
-                    except Exception:
-                        rsv = {}
-                if isinstance(rsv, dict) and rsv.get("status") == "OK":
-                    uid = rsv.get("cleanroom_uuid") or rsv.get("api_cleanroom_name") or cr
-                    collab_name = f"migrated_{re.sub(r'[^a-zA-Z0-9]', '', str(uid))[:56] or 'cleanroom'}"
-            except Exception:
-                pass
+            collab_name = f"migrated_{cr.replace(' ', '_')}"
             status = ''
             safe_collab = collab_name.replace("'", "''")
             try:
