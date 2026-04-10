@@ -586,7 +586,7 @@ def _infer_py_arg_names(body, handler):
             continue
         pre_default = a.split('=', 1)[0].strip()
         name = pre_default.split(':', 1)[0].strip()
-        if not name or name in ('self', 'cls'):
+        if not name or name in ('self', 'cls', 'session'):
             continue
         parts.append(name)
     return parts if parts else None
@@ -792,6 +792,8 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
                 names = leg
             else:
                 names = ['arg_%d' % i for i in range(len(types))]
+        if len(names) != len(set(names)):
+            names = ['arg_%d' % i for i in range(len(names))]
         arguments = [{'name': names[i], 'type': _sql_type_from_legacy(types[i])} for i in range(len(types))]
         pkg_raw = row.get('PACKAGES') or ''
         packages = [p.strip() for p in str(pkg_raw).replace(';', ',').split(',') if p.strip()]
@@ -824,7 +826,13 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
         else:
             if not body_nonempty:
                 continue
-            fn_entry['code_body'] = body
+            hin = str(handler).rsplit('.', 1)[-1]
+            fixed_body = re.sub(
+                r'(def\s+' + re.escape(hin) + r'\s*\(\s*)session\s*,\s*',
+                r'\1',
+                body,
+            )
+            fn_entry['code_body'] = fixed_body
         functions.append(fn_entry)
 
     if not functions:
@@ -2057,6 +2065,24 @@ def agent_main(session, cleanroom_name, action_mode):
     job_id = str(_uuid.uuid4())
     job_role = None
     job_start = time.time()
+    _tool_version = 'v3.0'
+
+    def _set_query_tag(action, cr_type='', tmpl_count=0, do_count=0, has_python=False, has_freeform=False):
+        try:
+            safe_cr = cleanroom_name.replace("'", "''")[:100]
+            tag = (
+                "dcr_migration_tool:%s:action=%s:type=%s:cr=%s:tmpl=%s:do=%s:py=%s:ffs=%s"
+                % (_tool_version, action, cr_type, safe_cr, tmpl_count, do_count, has_python, has_freeform)
+            )
+            session.sql("ALTER SESSION SET QUERY_TAG = '%s'" % tag.replace("'", "''")).collect()
+        except Exception:
+            pass
+
+    def _clear_query_tag():
+        try:
+            session.sql("ALTER SESSION UNSET QUERY_TAG").collect()
+        except Exception:
+            pass
 
     def _log_job(status, result_str):
         try:
@@ -2084,6 +2110,7 @@ def agent_main(session, cleanroom_name, action_mode):
         except:
             status = 'UNKNOWN'
         _log_job(status, result_str)
+        _clear_query_tag()
         return result_str
 
     try:
@@ -2138,6 +2165,7 @@ def agent_main(session, cleanroom_name, action_mode):
             laf_info = " Note: LAF is enabled on this account. Please verify if this Cleanroom uses it."
         
         if action == 'TEARDOWN':
+            _set_query_tag('TEARDOWN', cleanroom_type)
             res = session.call("DCR_SNOWVA.MIGRATION.TEARDOWN", safe_collab_name)
             return _finish(json.dumps({"status": "SUCCESS", "message": res}))
 
@@ -2274,7 +2302,7 @@ def agent_main(session, cleanroom_name, action_mode):
              collab_yml = session.call("DCR_SNOWVA.MIGRATION.GENERATE_COLLABORATION_SPEC", cleanroom_name, prov_ids, [], tmp_ids, has_activation)
 
              script_lines.append(f"\n-- [{step_n}] CREATE COLLABORATION: {safe_collab_name}")
-             script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.initialize({dd}\n{collab_yml}\n{dd});\n")
+             script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.initialize({dd}\n{collab_yml}\n{dd}, 'APP_WH');\n")
              script_lines.append("-- NOTE: Under analysis_runners.Consumer_Account.data_providers you should see BOTH")
              script_lines.append("-- Provider_Account (your linked table, e.g. CUSTOMERS) AND Consumer_Account.")
              script_lines.append("-- Consumer_Account.data_offerings is [] until the consumer registers their dataset and links it.")
@@ -2283,6 +2311,17 @@ def agent_main(session, cleanroom_name, action_mode):
              script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.get_status('{safe_collab_name}');\n")
              script_lines.append(f"-- [{step_n + 1}] JOIN COLLABORATION (Self-Join for Provider)")
              script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.join('{safe_collab_name}');\n")
+             script_lines.append(f"-- [{step_n + 2}] ENABLE AUTO-APPROVAL FOR TEMPLATE REQUESTS")
+             script_lines.append("-- Allows collaborators to add templates without manual approval.")
+             script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.enable_template_auto_approval('{safe_collab_name}');\n")
+             if tmp_ids:
+                 script_lines.append(f"-- [{step_n + 3}] ADD TEMPLATE REQUESTS (share templates with all collaborators)")
+                 script_lines.append("-- Templates in INITIALIZE are scoped to analysis_runners; use add_template_request to widen sharing.")
+                 for t_id in tmp_ids:
+                     script_lines.append(
+                         "-- CALL samooha_by_snowflake_local_db.collaboration.add_template_request('%s', '%s', ['Provider_Account', 'Consumer_Account']);\n"
+                         % (safe_collab_name, t_id)
+                     )
              if is_prov_run:
                  script_lines.append(f"-- [5] PROVIDER-RUN ANALYSIS DETECTED")
                  script_lines.append(f"-- This legacy cleanroom has provider-run analysis enabled.")
@@ -2291,9 +2330,9 @@ def agent_main(session, cleanroom_name, action_mode):
                  script_lines.append(f"-- Consumer data offerings are listed as empty in the collaboration spec above")
                  script_lines.append(f"-- because the provider cannot see consumer datasets.\n")
              script_lines.append(f"-- CONSUMER: After reviewing and joining, the consumer should register their data offerings")
-             script_lines.append(f"-- and link them to the collaboration to update the spec:")
+             script_lines.append(f"-- and link them to the collaboration. List all collaborator aliases that need the data:")
              script_lines.append(f"-- CALL samooha_by_snowflake_local_db.registry.register_data_offering(<data_offering_spec>);")
-             script_lines.append(f"-- CALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '<data_offering_id>', ['Provider_Account']);")
+             script_lines.append(f"-- CALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '<data_offering_id>', ['Provider_Account', 'Consumer_Account']);")
         else:
              if not tmps and not dos:
                  script_lines.append(f"\n-- NOTE: No templates or data offerings found on the consumer side.")
@@ -2327,12 +2366,33 @@ def agent_main(session, cleanroom_name, action_mode):
 
              if dos:
                  script_lines.append(f"-- [5] LINK CONSUMER DATA OFFERINGS (run after join)")
-                 script_lines.append(f"-- link_data_offering shares your data with the specified analysis runner")
+                 script_lines.append(f"-- link_data_offering shares your data with the listed collaborators.")
                  script_lines.append(f"-- and updates the collaboration spec. This enables policy enforcement.\n")
                  for y_str in dos:
                      spec = yaml.safe_load(y_str)
                      do_id = f"{spec['name']}_{spec['version']}"
-                     script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '{do_id}', ['Provider_Account']);\n")
+                     script_lines.append(
+                         f"CALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '{do_id}', ['Provider_Account', 'Consumer_Account']);\n"
+                     )
+
+             consumer_tmp_ids = []
+             for t_entry in tmps or []:
+                 if isinstance(t_entry, dict) and t_entry.get('classification') == 'PLATFORM_PRIVACY':
+                     continue
+                 y_str = t_entry.get('yaml', '') if isinstance(t_entry, dict) else str(t_entry)
+                 try:
+                     spec = yaml.safe_load(y_str)
+                     consumer_tmp_ids.append(f"{spec['name']}_{spec['version']}")
+                 except Exception:
+                     pass
+             if consumer_tmp_ids:
+                 script_lines.append(f"-- [6] ADD TEMPLATE REQUESTS (share consumer templates with collaborators)")
+                 script_lines.append(f"-- Run enable_template_auto_approval first, then add_template_request for each template.\n")
+                 script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.enable_template_auto_approval('{safe_collab_name}');\n")
+                 for t_id in consumer_tmp_ids:
+                     script_lines.append(
+                         f"CALL samooha_by_snowflake_local_db.collaboration.add_template_request('{safe_collab_name}', '{t_id}', ['Provider_Account', 'Consumer_Account']);\n"
+                     )
 
         full_script_text = "\n".join(script_lines)
 
@@ -2343,6 +2403,14 @@ def agent_main(session, cleanroom_name, action_mode):
             ]
             t_count = len(registerable_tmps)
             d_count = len(dos) if dos else 0
+            _set_query_tag(
+                'PLAN',
+                cleanroom_type,
+                t_count,
+                d_count,
+                bool(py_code_spec),
+                cleanroom_type in ('UI_FREEFORM_SQL', 'PC_FREEFORM_SQL'),
+            )
             py_note = ""
             if py_udf_names:
                 py_note = " Python UDFs from LOAD_PYTHON_RECORD: %s." % (", ".join(py_udf_names[:20]))
@@ -2382,7 +2450,8 @@ def agent_main(session, cleanroom_name, action_mode):
 
         elif action == 'EXECUTE':
             actions_taken = []
-            
+            _set_query_tag('EXECUTE', cleanroom_type)
+
             if py_code_spec:
                 try:
                     session.call("SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.REGISTRY.REGISTER_CODE_SPEC", py_code_spec)
@@ -2470,6 +2539,7 @@ def agent_main(session, cleanroom_name, action_mode):
                 }))
 
         elif action == 'CHECK_STATUS':
+            _set_query_tag('CHECK_STATUS', cleanroom_type)
             try:
                 res = session.sql(f"CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.COLLABORATION.GET_STATUS('{safe_collab_name}')").collect()
                 overall_status = "UNKNOWN"
@@ -2530,6 +2600,7 @@ def agent_main(session, cleanroom_name, action_mode):
                 return _finish(json.dumps({"status": "ERROR", "message": err, "hint": hint}))
 
         elif action == 'JOIN':
+            _set_query_tag('JOIN', cleanroom_type)
             try:
                 if role_type == 'PROVIDER':
                     res = session.sql(f"CALL SAMOOHA_BY_SNOWFLAKE_LOCAL_DB.COLLABORATION.GET_STATUS('{safe_collab_name}')").collect()
@@ -2576,6 +2647,7 @@ def agent_main(session, cleanroom_name, action_mode):
                 return _finish(json.dumps({"status": "ERROR", "message": str(e)}))
             
         elif action == 'VALIDATE':
+            _set_query_tag('VALIDATE', cleanroom_type)
             report = session.call("DCR_SNOWVA.MIGRATION.VALIDATE", cleanroom_name, safe_collab_name)
             return _finish(str(report))
 
