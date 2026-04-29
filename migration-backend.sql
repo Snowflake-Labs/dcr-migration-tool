@@ -13,6 +13,10 @@
 -- See the License for the specific language governing permissions and
 -- limitations under the License.
 
+
+
+
+
 USE ROLE SAMOOHA_APP_ROLE;
 CREATE DATABASE IF NOT EXISTS DCR_SNOWVA;
 CREATE SCHEMA IF NOT EXISTS DCR_SNOWVA.MIGRATION;
@@ -690,6 +694,8 @@ def _build_python_code_spec_yaml(cleanroom_name, py_rows, code_spec_name, ver_st
     for row in py_rows:
         fname = row.get('FUNCTION_NAME')
         if not fname:
+            continue
+        if 'generic_sql_query_with_aggregation_and_projection_policies' in str(fname).lower():
             continue
         handler = row.get('HANDLER') or str(fname).split('_')[-1]
         arg_types_str = row.get('ARGUMENT_TYPES') or ''
@@ -1633,7 +1639,10 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
                 break
     except: pass
 
-    safe_collab_name = f"migrated_{human_name.replace(' ', '_').upper()}"
+    import re as _re2
+    safe_collab_name = f"migrated_{_re2.sub(r'[^A-Za-z0-9_]', '_', human_name).upper()}"
+    if len(safe_collab_name) > 75:
+        safe_collab_name = safe_collab_name[:75]
 
     yaml_str = f"api_version: 2.0.0\n"
     yaml_str += f"spec_type: collaboration\n"
@@ -1991,7 +2000,10 @@ def agent_main(session, cleanroom_name, action_mode):
         role_type = "PROVIDER" if is_provider else "CONSUMER"
         job_role = role_type
         
-        safe_collab_name = f"migrated_{human_readable_name.replace(' ', '_').upper()}"
+        import re as _re
+        safe_collab_name = f"migrated_{_re.sub(r'[^A-Za-z0-9_]', '_', human_readable_name).upper()}"
+        if len(safe_collab_name) > 75:
+            safe_collab_name = safe_collab_name[:75]
 
         if not is_provider:
             try:
