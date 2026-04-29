@@ -134,7 +134,7 @@ You have two options:
 1. Download `streamlit_app.py` from the GitHub repository.
 2. In [app.snowflake.com](https://app.snowflake.com), navigate to **Streamlit**.
 3. Click **+ Streamlit App**.
-4. Name it `Data Clean Room v1-to-v2 Migration Tool`.
+4. Name it `DCR Migration Tool`.
 5. Select a **Warehouse** and set the database/schema to `DCR_SNOWVA.MIGRATION`.
 6. Paste the contents of `streamlit_app.py` into the editor.
 7. Click **Create**.
