@@ -113,9 +113,9 @@ You may have a **pasted** script that looks similar but differs line-by-line fro
 - **Legal terms:** `SYSTEM$ACCEPT_LEGAL_TERMS` runs during collaboration **initialize** / **join**; it **cannot** run inside Streamlit or inside a stored procedure. Use a **SQL Worksheet** with the generated script when the app reports that hint.
 - **Template chains:** Legacy `add_template_chain` is **not** migrated; flatten into separate templates or handle outside the tool.
 - **ML Jobs / SPCS:** Cleanrooms using ML Jobs (compute pools) or SPCS (service functions) are **blocked** at pre-flight. These features are not yet supported in the Collaboration API.
-- **Differential Privacy:** DP-enabled templates will be migrated but **without noise injection** — this is a privacy downgrade. The tool warns but does not block. Confirm with the data provider before proceeding.
+- **Differential Privacy(supported with limitations):** DP-enabled templates are migrated but without noise injection — the Collaboration API does not support DP, so migrated queries return exact results. This is a privacy downgrade. The tool detects DP patterns (addnoise, laplace, dp_noise, privacy.epsilon) and warns at plan time but does not block migration. You must confirm with the data provider that removing noise protection is acceptable before proceeding.
 - **Platform privacy templates:** Skipped as Collaboration templates; handled via freeform SQL data offerings. Parity validation checks for freeform-enabled offerings.
-- **Aggregation policies:** Creating policies for freeform SQL may require **elevated privileges** (e.g. ACCOUNTADMIN).
+- **Aggregation policies:** Creating aggregation policies for freeform SQL data offerings requires elevated privileges. Run CREATE AGGREGATION POLICY as ACCOUNTADMIN (or a role with CREATE AGGREGATION POLICY privilege on the target schema) before executing the migration.
 
 ### 2. Deploy the Streamlit App
 
