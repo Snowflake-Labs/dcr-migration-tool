@@ -17,6 +17,8 @@
 
 
 
+
+
 USE ROLE SAMOOHA_APP_ROLE;
 CREATE DATABASE IF NOT EXISTS DCR_SNOWVA;
 CREATE SCHEMA IF NOT EXISTS DCR_SNOWVA.MIGRATION;
@@ -1599,8 +1601,6 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
                     'Consumer_Account': {'data_offerings': [{'id': x} for x in cons_ids]},
                 },
             }
-            if enable_activation:
-                 prov_runner_config['activation_destinations'] = {'snowflake_collaborators': ['Consumer_Account']}
             runners['Provider_Account'] = prov_runner_config
         else:
             can_prov_run = False
@@ -1619,8 +1619,6 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
                         'Consumer_Account': {'data_offerings': []},
                     },
                 }
-                if enable_activation:
-                     prov_runner_config['activation_destinations'] = {'snowflake_collaborators': ['Consumer_Account']}
                 runners['Provider_Account'] = prov_runner_config
 
     ver_str = "MIGRATION_V2"
