@@ -37,7 +37,7 @@ CREATE OR REPLACE TABLE DCR_SNOWVA.MIGRATION.MIGRATION_JOBS (
 CREATE OR REPLACE PROCEDURE DCR_SNOWVA.MIGRATION.CHECK_PREREQUISITES(CLEANROOM_NAME STRING)
 RETURNS VARIANT
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
+RUNTIME_VERSION = '3.10'
 PACKAGES = ('snowflake-snowpark-python', 'pandas')
 HANDLER = 'check_prereqs'
 EXECUTE AS CALLER
@@ -167,6 +167,29 @@ def check_prereqs(session, cleanroom_name):
                 f"This is a privacy downgrade — confirm with the data provider before proceeding."
             )
 
+        import re as _re_prereq
+        hardcoded_fqn_templates = []
+        try:
+            for t in tmps:
+                td = {k.upper(): v for k, v in t.as_dict().items()}
+                t_name = td.get('TEMPLATE_NAME', 'unknown')
+                t_body = str(td.get('TEMPLATE', ''))
+                has_placeholder = bool(_re_prereq.search(r'\{\{\s*(source_table|my_table)', t_body))
+                fqn_refs = _re_prereq.findall(r'(?<!\w)([A-Z][A-Z0-9_]*\.[A-Z][A-Z0-9_]*\.[A-Z][A-Z0-9_]*)', t_body.upper())
+                fqn_refs = [f for f in fqn_refs if not f.startswith('SAMOOHA_BY_SNOWFLAKE')]
+                if fqn_refs and not has_placeholder:
+                    hardcoded_fqn_templates.append(t_name)
+        except:
+            pass
+        if hardcoded_fqn_templates:
+            warnings.append(
+                f"Hardcoded view/table names detected in {len(hardcoded_fqn_templates)} template(s): "
+                f"{', '.join(hardcoded_fqn_templates[:5])}. "
+                f"These templates reference fully-qualified object names (DB.SCHEMA.TABLE) directly instead of "
+                f"using {{{{ source_table[] }}}} placeholders. They will NOT work in the Collaboration API without "
+                f"manual refactoring to replace hardcoded FQNs with source_table references and registered data offerings."
+            )
+
     if errors:
         return {"status": "FAIL", "errors": errors, "warnings": warnings, "cleanroom_type": cleanroom_type}
     result = {"status": "PASS", "cleanroom_type": cleanroom_type, "is_ui_cleanroom": is_ui_cleanroom, "target_uuid": target_uuid}
@@ -178,7 +201,7 @@ $$;
 CREATE OR REPLACE PROCEDURE DCR_SNOWVA.MIGRATION.PREVIEW(CLEANROOM_NAME STRING)
 RETURNS VARIANT
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
+RUNTIME_VERSION = '3.10'
 PACKAGES = ('snowflake-snowpark-python', 'pandas')
 HANDLER = 'preview'
 EXECUTE AS CALLER
@@ -389,7 +412,7 @@ $$;
 CREATE OR REPLACE PROCEDURE DCR_SNOWVA.MIGRATION.GENERATE_TEMPLATE_SPECS(CLEANROOM_NAME STRING)
 RETURNS VARIANT
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
+RUNTIME_VERSION = '3.10'
 PACKAGES = ('snowflake-snowpark-python', 'pandas', 'pyyaml')
 HANDLER = 'gen_templates'
 EXECUTE AS CALLER
@@ -979,6 +1002,16 @@ def gen_templates(session, cleanroom_name):
         yaml_header = yaml.dump(spec_dict_no_tpl, Dumper=LiteralBlockDumper, default_flow_style=False, sort_keys=False)
 
         tpl_clean = tpl_work.strip()
+
+        has_placeholder = bool(re.search(r'\{\{\s*(source_table|my_table)', tpl_clean))
+        fqn_refs = re.findall(r'(?<!\w)([A-Z][A-Z0-9_]*\.[A-Z][A-Z0-9_]*\.[A-Z][A-Z0-9_]*)', tpl_clean.upper())
+        fqn_refs = [f for f in fqn_refs if not f.startswith('SAMOOHA_BY_SNOWFLAKE')]
+        if fqn_refs and not has_placeholder:
+            for i, fqn in enumerate(fqn_refs):
+                fqn_pattern = re.compile(re.escape(fqn), re.IGNORECASE)
+                comment = f"/* MIGRATION: replace with identifier({{{{ source_table[{i}] }}}}) and register as data offering */ "
+                tpl_clean = fqn_pattern.sub(comment + fqn, tpl_clean, count=1)
+
         if '\n' in tpl_clean:
             tpl_lines = tpl_clean.split('\n')
             indented = '\n'.join('  ' + line.rstrip() for line in tpl_lines)
@@ -988,6 +1021,16 @@ def gen_templates(session, cleanroom_name):
             yaml_out = yaml_header + f"template: '{safe_tpl}'\n"
 
         specs.append({'yaml': yaml_out, 'template_name': t_name, 'classification': t_classification})
+
+        if fqn_refs and not has_placeholder:
+            specs[-1]['classification'] = 'HARDCODED_VIEWS'
+            specs[-1]['warning'] = (
+                f"This template references hardcoded view/table names ({', '.join(fqn_refs[:3])}) "
+                f"instead of using {{{{ source_table[] }}}} placeholders. It will NOT work in the "
+                f"Collaboration API without manual refactoring."
+            )
+            specs[-1]['hardcoded_references'] = fqn_refs[:10]
+
     return {
         'templates': specs,
         'python_code_spec': py_code_yaml,
@@ -999,7 +1042,7 @@ $$;
 CREATE OR REPLACE PROCEDURE DCR_SNOWVA.MIGRATION.GENERATE_DATA_OFFERING_SPECS(CLEANROOM_NAME STRING)
 RETURNS VARIANT
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
+RUNTIME_VERSION = '3.10'
 PACKAGES = ('snowflake-snowpark-python', 'pandas', 'pyyaml')
 HANDLER = 'gen_data_offerings'
 EXECUTE AS CALLER
@@ -1463,7 +1506,7 @@ CREATE OR REPLACE PROCEDURE DCR_SNOWVA.MIGRATION.GENERATE_COLLABORATION_SPEC(
 )
 RETURNS STRING
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
+RUNTIME_VERSION = '3.10'
 PACKAGES = ('snowflake-snowpark-python', 'pyyaml')
 HANDLER = 'gen_collab'
 EXECUTE AS CALLER
@@ -1543,15 +1586,15 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
         runner_config = {
             'templates': [{'id': x} for x in temp_ids]
         }
-        runner_config['data_providers'] = {'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]}}
+        runner_config['data_providers'] = {'admin': {'data_offerings': [{'id': x} for x in prov_ids]}}
         if enable_activation:
-            runner_config['activation_destinations'] = {'snowflake_collaborators': ['Provider_Account']}
-        runners['Provider_Account'] = runner_config
+            runner_config['activation_destinations'] = {'snowflake_collaborators': ['admin']}
+        runners['admin'] = runner_config
     elif len(all_consumers) > 1:
         for i, c_acct in enumerate(all_consumers):
-            c_alias = f"Consumer_{i+1}"
+            c_alias = f"analysis_runner_{i+1}"
             cons_dp = {
-                'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]},
+                'admin': {'data_offerings': [{'id': x} for x in prov_ids]},
                 c_alias: {'data_offerings': []},
             }
             cons_runner_config = {
@@ -1570,38 +1613,38 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
                 if "provider side run analysis is enabled" in val: can_prov_run = True
         except: pass
         if can_prov_run:
-            prov_dp = {'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]}}
+            prov_dp = {'admin': {'data_offerings': [{'id': x} for x in prov_ids]}}
             for i in range(len(all_consumers)):
-                prov_dp[f"Consumer_{i+1}"] = {'data_offerings': []}
-            runners['Provider_Account'] = {
+                prov_dp[f"analysis_runner_{i+1}"] = {'data_offerings': []}
+            runners['admin'] = {
                 'templates': [{'id': x} for x in temp_ids],
                 'data_providers': prov_dp,
             }
     else:
-        # Consumer_Account runner must list BOTH collaborators' offerings: provider data (e.g. CUSTOMERS)
-        # and consumer data (e.g. labels / my_table). Previously only Provider_Account appeared, which made
+        # analysis_runner runner must list BOTH collaborators' offerings: provider data (e.g. CUSTOMERS)
+        # and consumer data (e.g. labels / my_table). Previously only admin appeared, which made
         # the spec look like the consumer data offering was "missing" for cross-table templates (lookalike).
         cons_dp = {
-            'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]},
-            'Consumer_Account': {'data_offerings': [{'id': x} for x in cons_ids]},
+            'admin': {'data_offerings': [{'id': x} for x in prov_ids]},
+            'analysis_runner': {'data_offerings': [{'id': x} for x in cons_ids]},
         }
         cons_runner_config = {
             'templates': [{'id': x} for x in temp_ids],
             'data_providers': cons_dp,
         }
         if enable_activation:
-            cons_runner_config['activation_destinations'] = {'snowflake_collaborators': ['Consumer_Account']}
-        runners['Consumer_Account'] = cons_runner_config
+            cons_runner_config['activation_destinations'] = {'snowflake_collaborators': ['analysis_runner']}
+        runners['analysis_runner'] = cons_runner_config
 
         if cons_ids:
             prov_runner_config = {
                 'templates': [{'id': x} for x in temp_ids],
                 'data_providers': {
-                    'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]},
-                    'Consumer_Account': {'data_offerings': [{'id': x} for x in cons_ids]},
+                    'admin': {'data_offerings': [{'id': x} for x in prov_ids]},
+                    'analysis_runner': {'data_offerings': [{'id': x} for x in cons_ids]},
                 },
             }
-            runners['Provider_Account'] = prov_runner_config
+            runners['admin'] = prov_runner_config
         else:
             can_prov_run = False
             try:
@@ -1615,11 +1658,11 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
                 prov_runner_config = {
                     'templates': [{'id': x} for x in temp_ids],
                     'data_providers': {
-                        'Provider_Account': {'data_offerings': [{'id': x} for x in prov_ids]},
-                        'Consumer_Account': {'data_offerings': []},
+                        'admin': {'data_offerings': [{'id': x} for x in prov_ids]},
+                        'analysis_runner': {'data_offerings': []},
                     },
                 }
-                runners['Provider_Account'] = prov_runner_config
+                runners['admin'] = prov_runner_config
 
     ver_str = "MIGRATION_V2"
 
@@ -1647,16 +1690,16 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
     yaml_str += f"name: {safe_collab_name}\n"
     yaml_str += f"description: 'Migrated from P&C: {cleanroom_name}'\n"
     yaml_str += f"version: {ver_str}\n"
-    yaml_str += f"owner: Provider_Account\n"
+    yaml_str += f"owner: admin\n"
     
     if is_single_account:
         aliases = {
             'collaborator_identifier_aliases': {
-                'Provider_Account': prov_acct
+                'admin': prov_acct
             }
         }
     elif len(all_consumers) > 1:
-        alias_map = {'Provider_Account': prov_acct}
+        alias_map = {'admin': prov_acct}
         for i, c_acct in enumerate(all_consumers):
             resolved_c = c_acct
             if '.' not in resolved_c:
@@ -1664,13 +1707,13 @@ def gen_collab(session, cleanroom_name, prov_ids, cons_ids, temp_ids, enable_act
                     curr_org = session.sql("SELECT CURRENT_ORGANIZATION_NAME()").collect()[0][0]
                     resolved_c = f"{curr_org}.{c_acct}"
                 except: pass
-            alias_map[f"Consumer_{i+1}"] = resolved_c
+            alias_map[f"analysis_runner_{i+1}"] = resolved_c
         aliases = {'collaborator_identifier_aliases': alias_map}
     else:
         aliases = {
             'collaborator_identifier_aliases': {
-                'Provider_Account': prov_acct,
-                'Consumer_Account': cons_acct
+                'admin': prov_acct,
+                'analysis_runner': cons_acct
             }
         }
     yaml_str += yaml.dump(aliases, sort_keys=False)
@@ -1686,7 +1729,7 @@ $$;
 CREATE OR REPLACE PROCEDURE DCR_SNOWVA.MIGRATION.VALIDATE(CLEANROOM_NAME STRING, COLLABORATION_NAME STRING)
 RETURNS VARIANT
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
+RUNTIME_VERSION = '3.10'
 PACKAGES = ('snowflake-snowpark-python', 'pandas')
 HANDLER = 'validate'
 EXECUTE AS CALLER
@@ -1844,7 +1887,7 @@ $$;
 CREATE OR REPLACE PROCEDURE DCR_SNOWVA.MIGRATION.TEARDOWN(COLLABORATION_NAME STRING)
 RETURNS STRING
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
+RUNTIME_VERSION = '3.10'
 PACKAGES = ('snowflake-snowpark-python', 'pandas')
 HANDLER = 'teardown_collab'
 EXECUTE AS CALLER
@@ -1879,7 +1922,7 @@ CREATE OR REPLACE PROCEDURE DCR_SNOWVA.MIGRATION.AGENT_MIGRATE_ORCHESTRATOR(
 )
 RETURNS STRING
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.9'
+RUNTIME_VERSION = '3.10'
 PACKAGES = ('snowflake-snowpark-python', 'pandas', 'pyyaml', 'snowflake-snowpark-python')
 HANDLER = 'agent_main'
 EXECUTE AS CALLER
@@ -2136,9 +2179,9 @@ def agent_main(session, cleanroom_name, action_mode):
 
              script_lines.append(f"\n-- [{step_n}] CREATE COLLABORATION: {safe_collab_name}")
              script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.initialize({dd}\n{collab_yml}\n{dd}, 'APP_WH');\n")
-             script_lines.append("-- NOTE: Under analysis_runners.Consumer_Account.data_providers you should see BOTH")
-             script_lines.append("-- Provider_Account (your linked table, e.g. CUSTOMERS) AND Consumer_Account.")
-             script_lines.append("-- Consumer_Account.data_offerings is [] until the consumer registers their dataset and links it.")
+             script_lines.append("-- NOTE: Under analysis_runners.analysis_runner.data_providers you should see BOTH")
+             script_lines.append("-- admin (your linked table, e.g. CUSTOMERS) AND analysis_runner.")
+             script_lines.append("-- analysis_runner.data_offerings is [] until the consumer registers their dataset and links it.")
              script_lines.append("-- Lookalike-style templates use source_table (provider) and my_table (consumer); both must appear in the spec.\n")
              script_lines.append(f"-- Wait for status 'CREATED' before joining")
              script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.get_status('{safe_collab_name}');\n")
@@ -2152,7 +2195,7 @@ def agent_main(session, cleanroom_name, action_mode):
                  script_lines.append(f"-- Templates in the INITIALIZE spec are scoped to specific analysis_runners.")
                  script_lines.append(f"-- To share templates with additional collaborators after creation, use add_template_request:")
                  for t_id in tmp_ids:
-                     script_lines.append(f"-- CALL samooha_by_snowflake_local_db.collaboration.add_template_request('{safe_collab_name}', '{t_id}', ['Provider_Account', 'Consumer_Account']);\n")
+                     script_lines.append(f"-- CALL samooha_by_snowflake_local_db.collaboration.add_template_request('{safe_collab_name}', '{t_id}', ['admin', 'analysis_runner']);\n")
              if is_prov_run:
                  script_lines.append(f"-- [5] PROVIDER-RUN ANALYSIS DETECTED")
                  script_lines.append(f"-- This legacy cleanroom has provider-run analysis enabled.")
@@ -2163,7 +2206,7 @@ def agent_main(session, cleanroom_name, action_mode):
              script_lines.append(f"-- CONSUMER: After reviewing and joining, the consumer should register their data offerings")
              script_lines.append(f"-- and link them to the collaboration. Link to ALL collaborators who need the data:")
              script_lines.append(f"-- CALL samooha_by_snowflake_local_db.registry.register_data_offering(<data_offering_spec>);")
-             script_lines.append(f"-- CALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '<data_offering_id>', ['Provider_Account', 'Consumer_Account']);")
+             script_lines.append(f"-- CALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '<data_offering_id>', ['admin', 'analysis_runner']);")
         else:
              if not tmps and not dos:
                  script_lines.append(f"\n-- NOTE: No templates or data offerings found on the consumer side.")
@@ -2201,7 +2244,7 @@ def agent_main(session, cleanroom_name, action_mode):
                  for y_str in dos:
                      spec = yaml.safe_load(y_str)
                      do_id = f"{spec['name']}_{spec['version']}"
-                     script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '{do_id}', ['Provider_Account', 'Consumer_Account']);\n")
+                     script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '{do_id}', ['admin', 'analysis_runner']);\n")
 
              if tmps:
                  consumer_tmp_ids = []
@@ -2218,7 +2261,7 @@ def agent_main(session, cleanroom_name, action_mode):
                      script_lines.append(f"-- Run SET_CONFIGURATION for auto-approval, then add_template_request for each template.\n")
                      script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.set_configuration('{safe_collab_name}', 'TEMPLATE_AUTO_APPROVAL', 'true');\n")
                      for t_id in consumer_tmp_ids:
-                         script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.add_template_request('{safe_collab_name}', '{t_id}', ['Provider_Account', 'Consumer_Account']);\n")
+                         script_lines.append(f"CALL samooha_by_snowflake_local_db.collaboration.add_template_request('{safe_collab_name}', '{t_id}', ['admin', 'analysis_runner']);\n")
 
         full_script_text = "\n".join(script_lines)
 
@@ -2444,7 +2487,7 @@ def agent_main(session, cleanroom_name, action_mode):
                 manual_sql.append(f"CALL samooha_by_snowflake_local_db.collaboration.join('{safe_collab_name}');")
                 manual_sql.append(f"CALL samooha_by_snowflake_local_db.collaboration.get_status('{safe_collab_name}');")
                 for do_id in do_ids:
-                    manual_sql.append(f"\nCALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '{do_id}', ['Provider_Account', 'Consumer_Account']);")
+                    manual_sql.append(f"\nCALL samooha_by_snowflake_local_db.collaboration.link_data_offering('{safe_collab_name}', '{do_id}', ['admin', 'analysis_runner']);")
                 manual_sql.append(f"\nCALL samooha_by_snowflake_local_db.collaboration.set_configuration('{safe_collab_name}', 'TEMPLATE_AUTO_APPROVAL', 'true');")
 
                 actions_taken.append("Consumer data offerings registered.")
